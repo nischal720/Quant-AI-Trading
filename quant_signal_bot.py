@@ -45,6 +45,8 @@ CONFIG = {
     "scan_interval": 600
 }
 
+bot_status = {"status": "starting", "last_update": time.time(), "signals_count": 0}
+
 # Validate configuration
 for k in ("telegram_token", "chat_id"):
     if not CONFIG[k] or CONFIG[k].startswith("<"):
@@ -56,6 +58,16 @@ bot = Bot(token=CONFIG["telegram_token"])
 exchange = ccxt.binance({'enableRateLimit': True})
 app = Flask(__name__)
 
+
+@app.route('/')
+def home():
+    return json.dumps({
+        "message": "Crypto Quant Trading Bot is Running",
+        "status": bot_status["status"],
+        "uptime": time.time() - bot_status["last_update"],
+        "signals_processed": bot_status["signals_count"],
+        "open_signals": len(open_signals)
+    })
 @app.route('/health')
 def health(): return "ok"
 def run_flask(): app.run(host="0.0.0.0", port=10000)
