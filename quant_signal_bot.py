@@ -20,8 +20,8 @@ warnings.filterwarnings('ignore')
 
 # ================== CONFIGURATION ==================
 CONFIG = {
-    "telegram_token": os.environ.get("BOT_TOKEN", "Your Bot Token"),
-    "chat_id": os.environ.get("CHANNEL_ID", "Chat ID"),
+    "telegram_token": os.environ.get("BOT_TOKEN", "YourBotToken"),
+    "chat_id": os.environ.get("CHANNEL_ID", "YourChannelID"),
     "pairs": [
         ("SOLUSDT", "BTCUSDT"), ("BNBUSDT", "BTCUSDT"), ("ETHUSDT", "BTCUSDT"),
         ("DOGEUSDT", "BTCUSDT"), ("ADAUSDT", "BTCUSDT"), ("XRPUSDT", "BTCUSDT"), 
@@ -59,14 +59,12 @@ exchange = ccxt.binance({'enableRateLimit': True})
 app = Flask(__name__)
 
 
-@app.route('/')
+@app.route('/ping')
 def home():
     return json.dumps({
         "message": "Crypto Quant Trading Bot is Running",
         "status": bot_status["status"],
         "uptime": time.time() - bot_status["last_update"],
-        "signals_processed": bot_status["signals_count"],
-        "open_signals": len(open_signals)
     })
 @app.route('/health')
 def health(): return "ok"
