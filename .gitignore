@@ -4,3 +4,4 @@ __pycache__/
 signals_log.jsonl
 *.pkl
 .env
+.venv
