@@ -4,7 +4,7 @@ import os, sys, time, asyncio, threading, json
 import ccxt
 import pandas as pd
 import pandas_ta as pta
-import pandas_ta as talib
+import talib
 import numpy as np
 from telegram import Bot
 from flask import Flask

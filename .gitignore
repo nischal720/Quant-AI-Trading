@@ -1,7 +1,6 @@
 __pycache__/
 *.pyc
 *.pyo
-signals_log.jsonl
 *.pkl
 .env
 .venv
