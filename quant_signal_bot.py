@@ -16,6 +16,10 @@ from sklearn.metrics import classification_report, roc_auc_score, confusion_matr
 import xgboost as xgb
 import pickle
 import warnings
+import aiohttp
+import ccxt.async_support as ccxt_async 
+from tenacity import retry, wait_exponential, stop_after_attempt , retry_if_exception_type
+import httpx
 warnings.filterwarnings('ignore')
 
 # ================== CONFIGURATION ==================
@@ -23,9 +27,8 @@ CONFIG = {
     "telegram_token": os.environ.get("BOT_TOKEN", "YourBotToken"),
     "chat_id": os.environ.get("CHANNEL_ID", "YourChannelID"),
     "pairs": [
-        ("SOLUSDT", "BTCUSDT"), ("BNBUSDT", "BTCUSDT"), ("ETHUSDT", "BTCUSDT"),
-        ("DOGEUSDT", "BTCUSDT"), ("ADAUSDT", "BTCUSDT"), ("XRPUSDT", "BTCUSDT"), 
-        ("TONUSDT", "BTCUSDT")
+        ("SOLUSDT", "BTCUSDT"), ("BNBUSDT", "BTCUSDT"), ("ADAUSDT", "BTCUSDT"), ("XRPUSDT", "BTCUSDT"), 
+        ("TONUSDT", "BTCUSDT"),("TRBUSDT", "BTCUSDT"), 
     ],
     "timeframes": ["15m", "1h", "4h", "1d"],
     "conf_threshold": 85,
@@ -55,7 +58,12 @@ for k in ("telegram_token", "chat_id"):
 
 # Initialize components
 bot = Bot(token=CONFIG["telegram_token"])
-exchange = ccxt.binance({'enableRateLimit': True})
+
+exchange = ccxt_async.binance({
+    'enableRateLimit': True,
+    'options': {'defaultType': 'future', 'adjustForTimeDifference': True}
+})
+
 app = Flask(__name__)
 
 
@@ -73,21 +81,23 @@ def run_flask(): app.run(host="0.0.0.0", port=10000)
 # Global variables
 open_signals = {}
 signal_history = []
+semaphore = asyncio.Semaphore(10)  # Control concurrent requests
 
 # ================== DATA FETCHING ==================
-def fetch_ohlcv(symbol, timeframe, limit=300):
-    """Fetch OHLCV data with retry logic"""
-    for delay in [0, 2, 5]:
+@retry(wait=wait_exponential(multiplier=1, min=1, max=10), stop=stop_after_attempt(5))
+async def fetch_ohlcv(symbol, timeframe, limit=300):
+    
+    async with semaphore: # global asyncio.Semaphore(10)
+        data = await exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
         try:
-            d = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-            df = pd.DataFrame(d, columns=['ts','open','high','low','close','volume'])
-            df['ts']=pd.to_datetime(df['ts'],unit='ms')
-            df.set_index('ts',inplace=True)
-            return df
+          df = pd.DataFrame(data, columns=['ts','open','high','low','close','volume'])
+          df['ts']=pd.to_datetime(df['ts'],unit='ms')
+          df.set_index('ts',inplace=True)
+          return df
         except Exception as e:
-            print(f"fetch_ohlcv {symbol}-{timeframe}: {e}, retrying {delay}s")
-            time.sleep(delay)
-    raise RuntimeError(f"Failed to fetch OHLCV for {symbol}-{timeframe}")
+         print(f"Error fetching data for {symbol} {timeframe}: {e}")
+         return None
+        
 
 # ================== ADVANCED INDICATORS ==================
 def advanced_indicators(df):
@@ -152,7 +162,7 @@ def advanced_indicators(df):
     # Momentum
     df['roc'] = pta.roc(df['close'], length=10)
     df['cci'] = pta.cci(df['high'], df['low'], df['close'])
-    
+    df = df.fillna(method='ffill').fillna(0)
     return df
 
 def add_candle_patterns(df):
@@ -379,26 +389,33 @@ def detect_market_regime(df):
     else:
         return "neutral"
 
-def multi_timeframe_confluence(symbol, ref_symbol):
+async def multi_timeframe_confluence(symbol, ref_symbol):
     """Check confluence across multiple timeframes"""
     confluence_score = 0
     tf_data = {}
-    
+
     for tf in ["1h", "4h", "1d"]:
         try:
-            df = fetch_ohlcv(symbol, tf, limit=100)
+            df = await fetch_ohlcv(symbol, tf, limit=100)
             df = advanced_indicators(df)
             tf_data[tf] = df
-            
+
             last = df.iloc[-1]
-            # Trend confluence
+
+            # ✅ Skip if any EMA is NaN
+            if pd.isna(last['ema20']) or pd.isna(last['ema50']) or pd.isna(last['ema200']):
+                print(f"[SKIP] Missing EMA values for {symbol}-{tf}")
+                continue
+
+            # Trend confluence (safe now)
             if last['ema20'] > last['ema50'] > last['ema200']:
                 confluence_score += 1
             elif last['ema20'] < last['ema50'] < last['ema200']:
                 confluence_score -= 1
+
         except Exception as e:
             print(f"Multi-TF error for {symbol}-{tf}: {e}")
-    
+
     return confluence_score, tf_data
 
 # ================== COMPLETE ML CLASSIFIER WITH ALL THREE ALGORITHMS ==================
@@ -966,12 +983,34 @@ def get_enhanced_signal(df, chart_patterns, fvg, choch, sr_levels, smt_result, r
     return None
 
 # ================== TELEGRAM & LOGGING ==================
+@retry(
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    stop=stop_after_attempt(5),
+    retry=retry_if_exception_type((httpx.ConnectError, httpx.TimeoutException)),
+    reraise=True
+)
 async def send_telegram(text):
-    """Send telegram message"""
+    """Ultra-reliable Telegram message sender"""
     try:
-        await bot.send_message(chat_id=CONFIG["chat_id"], text=text)
+        # Try direct connection first
+        await bot.send_message(
+            chat_id=CONFIG["chat_id"],
+            text=text,
+            read_timeout=30,
+            write_timeout=30,
+            connect_timeout=30
+        )
+    except httpx.ConnectError as e:
+        print(f"Connection failed, will retry: {e}")
+        raise
+    except httpx.TimeoutException as e:
+        print(f"Timeout occurred, will retry: {e}")
+        raise
     except Exception as e:
-        print(f"Telegram error: {e}")
+        print(f"Unexpected Telegram error: {e}")
+        # Don't retry for other errors
+        return False
+    return True
 
 def log_signal(signal):
     """Log signal to file"""
@@ -994,19 +1033,21 @@ def update_signal_outcome(signal_key, outcome):
 
 # ================== MAIN MONITORING LOOP ==================
 async def monitor():
-    """Main monitoring loop with complete ML integration"""
+    """Main monitoring loop with complete ML integration and heartbeat messages"""
     global open_signals, signal_history
     
     print("[STARTUP] 🚀 Initializing Complete ML Crypto Quant Bot...")
     print(f"[ML] Algorithms: RandomForest, GradientBoosting, XGBoost")
     
+    # Heartbeat control
+    heartbeats_sent = 0
+    CYCLE_COUNT = 0      # increments every scan
+    
     # Load ML model
     if CONFIG['ml_enabled']:
         if not ml_classifier.load_models():
             print("[ML] No pre-trained model found. Training new models...")
-            # Use historical data or simulate for demo
             historical_signals = simulate_historical_outcomes()
-            
             if len(historical_signals) >= 100:
                 X, y = ml_classifier.prepare_training_data(historical_signals)
                 if ml_classifier.train_all_models(X, y):
@@ -1019,16 +1060,17 @@ async def monitor():
     retrain_counter = 0
     
     while True:
+        CYCLE_COUNT += 1   # heartbeat counter
         try:
             print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting enhanced ML analysis cycle...")
             
             # Clean stale signals
             open_signals = clean_stale_signals(open_signals)
             
-            # Retrain ML models periodically
+            # Periodic ML retraining
             if CONFIG['ml_enabled'] and len(signal_history) > 50:
                 retrain_counter += 1
-                if retrain_counter % 48 == 0:  # Every 48 cycles (24 hours)
+                if retrain_counter % 48 == 0:
                     print("[ML] Periodic model retraining with new data...")
                     outcomes = [s for s in signal_history if 'outcome' in s]
                     if len(outcomes) >= 100:
@@ -1036,40 +1078,32 @@ async def monitor():
                         if ml_classifier.train_all_models(X, y):
                             ml_classifier.save_models()
             
-            # Process each trading pair
+            # --- scan each pair / timeframe ---
             for symbol, ref_symbol in CONFIG["pairs"]:
                 for tf in CONFIG["timeframes"]:
                     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Analyzing {symbol}-{tf}...")
-                    
                     try:
-                        # Fetch and process data
-                        df = fetch_ohlcv(symbol, tf)
-                        df_ref = fetch_ohlcv(ref_symbol, tf)
-                        
-                        # Align reference data
+                        df      = await fetch_ohlcv(symbol, tf)
+                        df_ref  = await  fetch_ohlcv(ref_symbol, tf)
                         if not df.index.equals(df_ref.index):
                             df_ref = df_ref.reindex(df.index, method='nearest').fillna(method='ffill')
-                        
-                        # Calculate indicators and patterns
+                            
                         df = advanced_indicators(df)
                         df = add_candle_patterns(df)
                         df = order_flow_analysis(df)
                         
-                        # Market analysis
-                        regime = detect_market_regime(df)
-                        confluence_score, _ = multi_timeframe_confluence(symbol, ref_symbol)
-                        
-                        # Pattern detection
-                        chart_patterns = get_chart_patterns(df)
-                        fvg = detect_fvg(df)
-                        sr_levels = find_sr_zones(df)
-                        choch = detect_bos_choch(df)
-                        smt = smt_divergence(df, df_ref, window=CONFIG["smt_window"])
+                        regime            = detect_market_regime(df)
+                        confluence_score, _ = await multi_timeframe_confluence(symbol, ref_symbol)
+                        chart_patterns    = get_chart_patterns(df)
+                        fvg               = detect_fvg(df)
+                        sr_levels         = find_sr_zones(df)
+                        choch             = detect_bos_choch(df)
+                        smt               = smt_divergence(df, df_ref, window=CONFIG["smt_window"])
                         
                         print(f"[ANALYSIS] {symbol}-{tf}: Regime={regime}, Confluence={confluence_score}, Patterns={len(chart_patterns)}")
                         
-                        # Generate signal with complete ML
-                        sig = get_enhanced_signal(df, chart_patterns, fvg, choch, sr_levels, smt, regime, confluence_score)
+                        sig = get_enhanced_signal(df, chart_patterns, fvg, choch,
+                                                  sr_levels, smt, regime, confluence_score)
                         price = df['close'].iloc[-1]
                         
                         if sig:
@@ -1079,14 +1113,13 @@ async def monitor():
                             
                             print(f"[SIGNAL] {symbol} {tf} {sig['direction']} | Score: {sig['score']} | ML({sig['ml_model']}): {sig['ml_confidence']:.3f}")
                             
-                            # Check for duplicate signals
+                            # duplicate check
                             if sig_key in open_signals and open_signals[sig_key].get('bar_ts') == bar_ts:
                                 continue
                             
-                            # Handle existing signal SL/TP
+                            # SL / TP handler for open positions
                             if sig_key in open_signals:
                                 signal = open_signals[sig_key]
-                                
                                 if signal['direction'] == 'LONG':
                                     if price <= signal['sl']:
                                         await send_telegram(f"📉 {symbol} LONG Stop Loss hit at {price:.4f} ({tf})")
@@ -1110,13 +1143,12 @@ async def monitor():
                                         del open_signals[sig_key]
                                         continue
                             
-                            # New signal
+                            # new signal
                             open_signals[sig_key] = sig
                             signal_history.append(sig)
                             log_signal(sig)
                             
-                            # Enhanced telegram message with ML info
-                            tps_str = ', '.join(f"{tp:.4f}" for tp in sig['tps'])
+                            tps_str    = ', '.join(f"{tp:.4f}" for tp in sig['tps'])
                             patterns_str = ', '.join(sig['patterns'][:3]) if sig['patterns'] else "None"
                             
                             msg = (f"🤖 ML-POWERED SIGNAL\n"
@@ -1128,32 +1160,45 @@ async def monitor():
                                    f"📋 Patterns: {patterns_str}\n"
                                    f"🔄 Confluence: {confluence_score} | ATR: {sig['atr']:.4f}")
                             
-                            if sig['smt']:
-                                msg += f"\n📊 SMT: {sig['smt']}"
-                            if sig['choch']:
-                                msg += f" | 🔄 BOS: {sig['choch']}"
-                            
+                            if sig['smt']: msg += f"\n📊 SMT: {sig['smt']}"
+                            if sig['choch']: msg += f" | 🔄 BOS: {sig['choch']}"
                             await send_telegram(msg)
+                            
                         else:
                             print(f"[NO SIGNAL] {symbol}-{tf} | Regime: {regime}")
                     
                     except Exception as e:
                         print(f"[ERROR] {symbol}-{tf}: {e}")
             
-            # Status update
-            ml_signals = len([s for s in signal_history if s.get('ml_confidence', 0) > CONFIG['ml_threshold']])
-            total_signals = len(signal_history)
-            print(f"[CYCLE COMPLETE] Open: {len(open_signals)} | ML signals: {ml_signals}/{total_signals}")
+            # --------------------------------------
+            # Heartbeat / no-signal summary
+            # --------------------------------------
+            open_cnt   = len(open_signals)
+            total_cnt  = len(signal_history)
+            ml_cnt     = len([s for s in signal_history
+                              if s.get('ml_confidence', 0) > CONFIG['ml_threshold']])
             
+            if open_cnt == 0:
+                msg = (f"💤 No active signals – bot scanning...\n"
+                       f"📊 Total generated: {total_cnt} | ML-filtered: {ml_cnt}\n"
+                       f"⏱️ Next scan in {CONFIG['scan_interval']}s")
+            else:
+                msg = (f"🔄 Scan complete – {open_cnt} active signal(s)\n"
+                       f"📊 Total generated: {total_cnt} | ML-filtered: {ml_cnt}")
+            
+            await send_telegram(msg)
+            
+            print(f"[CYCLE COMPLETE #{CYCLE_COUNT}] Open: {open_cnt} | ML signals: {ml_cnt}/{total_cnt}")
             if ml_classifier.best_model_name:
                 print(f"[ML STATUS] Best Model: {ml_classifier.best_model_name}")
             
-            print(f"[SLEEP] Waiting {CONFIG['scan_interval']} seconds...")
+            print(f"[SLEEP] Waiting {CONFIG['scan_interval']}s...")
+            await exchange.close()
             await asyncio.sleep(CONFIG['scan_interval'])
             
         except Exception as e:
             print(f"[CRITICAL ERROR] {e}")
-            await asyncio.sleep(60)  # Wait 1 minute before retry
+            await asyncio.sleep(60)
 
 # ================== MAIN ENTRY POINT ==================
 if __name__ == "__main__":
