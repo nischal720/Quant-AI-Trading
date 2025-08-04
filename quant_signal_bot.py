@@ -28,9 +28,9 @@ CONFIG = {
     "chat_id": os.environ.get("CHANNEL_ID", "YourChannelID"),
     "pairs": [
         ("SOLUSDT", "BTCUSDT"), ("BNBUSDT", "BTCUSDT"), ("ADAUSDT", "BTCUSDT"), ("XRPUSDT", "BTCUSDT"), 
-        ("TONUSDT", "BTCUSDT"),("TRBUSDT", "BTCUSDT"), 
+        ("TONUSDT", "BTCUSDT"),("SUIUSDT", "BTCUSDT"), ("LINKUSDT", "BTCUSDT"),("SEIUSDT", "BTCUSDT"),("DOGEUSDT", "BTCUSDT"),("POLUSDT", "BTCUSDT"),
     ],
-    "timeframes": ["15m", "1h", "4h", "1d"],
+    "timeframes": ["1h", "4h", "1d"],
     "conf_threshold": 85,
     "atr_sl_mult": 1.8,
     "atr_tp_mult": 2.5,
@@ -45,7 +45,7 @@ CONFIG = {
     "multi_tf_confluence": True,
     "volatility_filter": True,
     "order_flow_analysis": True,
-    "scan_interval": 600
+    "scan_interval": 300
 }
 
 bot_status = {"status": "starting", "last_update": time.time(), "signals_count": 0}
