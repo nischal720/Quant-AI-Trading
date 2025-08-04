@@ -8,7 +8,7 @@ import talib
 import numpy as np
 from telegram import Bot
 from flask import Flask
-from datetime import datetime
+from datetime import datetime, timedelta
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.preprocessing import StandardScaler
@@ -45,7 +45,8 @@ CONFIG = {
     "multi_tf_confluence": True,
     "volatility_filter": True,
     "order_flow_analysis": True,
-    "scan_interval": 300
+    "scan_interval": 300,
+    "live_data_interval": 5  # Seconds between live data checks
 }
 
 bot_status = {"status": "starting", "last_update": time.time(), "signals_count": 0}
@@ -66,7 +67,6 @@ exchange = ccxt_async.binance({
 
 app = Flask(__name__)
 
-
 @app.route('/ping')
 def home():
     return json.dumps({
@@ -74,30 +74,40 @@ def home():
         "status": bot_status["status"],
         "uptime": time.time() - bot_status["last_update"],
     })
+
 @app.route('/health')
 def health(): return "ok"
+
 def run_flask(): app.run(host="0.0.0.0", port=10000)
 
 # Global variables
 open_signals = {}
 signal_history = []
 semaphore = asyncio.Semaphore(10)  # Control concurrent requests
+live_data_cache = {}  # For storing live market data
 
 # ================== DATA FETCHING ==================
 @retry(wait=wait_exponential(multiplier=1, min=1, max=10), stop=stop_after_attempt(5))
 async def fetch_ohlcv(symbol, timeframe, limit=300):
-    
-    async with semaphore: # global asyncio.Semaphore(10)
-        data = await exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+    async with semaphore:
         try:
-          df = pd.DataFrame(data, columns=['ts','open','high','low','close','volume'])
-          df['ts']=pd.to_datetime(df['ts'],unit='ms')
-          df.set_index('ts',inplace=True)
-          return df
+            data = await exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+            df = pd.DataFrame(data, columns=['ts','open','high','low','close','volume'])
+            df['ts'] = pd.to_datetime(df['ts'], unit='ms')
+            df.set_index('ts', inplace=True)
+            return df
         except Exception as e:
-         print(f"Error fetching data for {symbol} {timeframe}: {e}")
-         return None
-        
+            print(f"Error fetching data for {symbol} {timeframe}: {e}")
+            return None
+
+async def fetch_live_price(symbol):
+    """Fetch live price using Binance API"""
+    try:
+        ticker = await exchange.fetch_ticker(symbol)
+        return ticker['last']
+    except Exception as e:
+        print(f"Error fetching live price for {symbol}: {e}")
+        return None
 
 # ================== ADVANCED INDICATORS ==================
 def advanced_indicators(df):
@@ -106,6 +116,10 @@ def advanced_indicators(df):
     df['ema20'] = pta.ema(df['close'], 20)
     df['ema50'] = pta.ema(df['close'], 50)
     df['ema200'] = pta.ema(df['close'], 200)
+    
+    # Golden/Death Cross detection
+    df['golden_cross'] = (df['ema50'] > df['ema200']) & (df['ema50'].shift(1) <= df['ema200'].shift(1))
+    df['death_cross'] = (df['ema50'] < df['ema200']) & (df['ema50'].shift(1) >= df['ema200'].shift(1))
     
     # RSI variants
     df['rsi'] = pta.rsi(df['close'], 14)
@@ -198,6 +212,23 @@ def order_flow_analysis(df):
     df['selling_pressure'] = (df['high'] - df['close']) / (df['high'] - df['low'])
     
     return df
+
+# ================== GOLDEN CROSS DETECTION ==================
+def detect_golden_cross(df):
+    """Detect golden cross (EMA50 crossing above EMA200) and death cross"""
+    if len(df) < 2:
+        return None
+        
+    prev_ema50 = df['ema50'].iloc[-2]
+    prev_ema200 = df['ema200'].iloc[-2]
+    current_ema50 = df['ema50'].iloc[-1]
+    current_ema200 = df['ema200'].iloc[-1]
+    
+    if prev_ema50 <= prev_ema200 and current_ema50 > current_ema200:
+        return "golden"
+    elif prev_ema50 >= prev_ema200 and current_ema50 < current_ema200:
+        return "death"
+    return None
 
 # ================== CHART PATTERN DETECTION ==================
 def detect_double_top(df, tol=0.01):
@@ -402,12 +433,12 @@ async def multi_timeframe_confluence(symbol, ref_symbol):
 
             last = df.iloc[-1]
 
-            # ✅ Skip if any EMA is NaN
+            # Skip if any EMA is NaN
             if pd.isna(last['ema20']) or pd.isna(last['ema50']) or pd.isna(last['ema200']):
                 print(f"[SKIP] Missing EMA values for {symbol}-{tf}")
                 continue
 
-            # Trend confluence (safe now)
+            # Trend confluence
             if last['ema20'] > last['ema50'] > last['ema200']:
                 confluence_score += 1
             elif last['ema20'] < last['ema50'] < last['ema200']:
@@ -418,130 +449,57 @@ async def multi_timeframe_confluence(symbol, ref_symbol):
 
     return confluence_score, tf_data
 
-# ================== COMPLETE ML CLASSIFIER WITH ALL THREE ALGORITHMS ==================
-class CompleteCryptoMLClassifier:
+# ================== OPTIMIZED ML CLASSIFIER ==================
+class OptimizedCryptoMLClassifier:
     def __init__(self):
         self.models = {}
         self.scalers = {}
         self.feature_names = []
         self.best_model_name = None
         self.performance_history = {}
+        self.last_retrained = 0
         
-    def create_features(self, df, chart_patterns, fvg, choch, sr_levels):
-        """Create comprehensive feature set for ML"""
+    def create_features(self, df, chart_patterns, fvg, choch, sr_levels, golden_cross):
+        """Create optimized feature set for ML"""
         last = df.iloc[-1]
         prev = df.iloc[-2]
         
+        # Focus on most predictive features
         features = {
-            # Technical indicators (20+ features)
-            'rsi': last['rsi'], 'rsi_fast': last['rsi_fast'], 'rsi_slow': last['rsi_slow'],
-            'macd': last['macd'], 'macds': last['macds'], 'macd_hist': last['macd_hist'],
-            'bb_position': last['bb_position'], 'bb_width': last['bb_width'],
-            'stoch_k': last['stoch_k'], 'stoch_d': last['stoch_d'],
-            'williams_r': last['williams_r'], 'adx': last['adx'],
-            'atr_pct': last['atr_pct'], 'volatility': last['volatility'],
-            'vol_ratio': last['vol_ratio'], 'cmf': last['cmf'], 'mfi': last['mfi'],
-            'roc': last['roc'], 'cci': last['cci'],
-            'dmp': last['dmp'], 'dmn': last['dmn'],
-            
-            # Price action (10+ features)
-            'body_size': last['body_size'], 'upper_shadow': last['upper_shadow'],
-            'lower_shadow': last['lower_shadow'], 'range_pct': last['range_pct'],
-            'buying_pressure': last['buying_pressure'], 'selling_pressure': last['selling_pressure'],
-            'gap_up': 1 if last['open'] > prev['close'] * 1.002 else 0,
-            'gap_down': 1 if last['open'] < prev['close'] * 0.998 else 0,
-            'higher_high': 1 if last['high'] > prev['high'] else 0,
-            'lower_low': 1 if last['low'] < prev['low'] else 0,
-            
-            # Trend features (10+ features)
+            # Trend and momentum
             'ema_alignment': 1 if last['ema20'] > last['ema50'] > last['ema200'] else 
                            -1 if last['ema20'] < last['ema50'] < last['ema200'] else 0,
-            'price_vs_ema20': (last['close'] - last['ema20']) / last['ema20'],
+            'golden_cross': 1 if golden_cross == "golden" else 0,
+            'death_cross': 1 if golden_cross == "death" else 0,
             'price_vs_ema200': (last['close'] - last['ema200']) / last['ema200'],
-            'ema20_slope': (last['ema20'] - prev['ema20']) / prev['ema20'],
-            'momentum_1': (last['close'] - prev['close']) / prev['close'],
-            'momentum_5': (last['close'] - df['close'].iloc[-6]) / df['close'].iloc[-6] if len(df) >= 6 else 0,
-            'price_position_range': (last['close'] - df['low'].tail(20).min()) / (df['high'].tail(20).max() - df['low'].tail(20).min()),
-            'consecutive_up': len([1 for i in range(min(5, len(df)-1)) if df['close'].iloc[-(i+1)] > df['close'].iloc[-(i+2)]]),
-            'consecutive_down': len([1 for i in range(min(5, len(df)-1)) if df['close'].iloc[-(i+1)] < df['close'].iloc[-(i+2)]]),
-            'macd_crossover': 1 if last['macd'] > last['macds'] and prev['macd'] <= prev['macds'] else 0,
+            'adx': last['adx'],
+            'rsi': last['rsi'],
+            'macd_hist': last['macd_hist'],
             
-            # Pattern features (15+ features)
+            # Volatility and volume
+            'atr_pct': last['atr_pct'],
+            'vol_ratio': last['vol_ratio'],
+            'vol_spike': 1 if last['vol_spike'] else 0,
+            
+            # Price action
+            'bb_position': last['bb_position'],
+            'body_size': last['body_size'],
+            'buying_pressure': last['buying_pressure'],
+            
+            # Key patterns
             'double_top': 1 if "Double Top" in chart_patterns else 0,
             'double_bottom': 1 if "Double Bottom" in chart_patterns else 0,
-            'triple_top': 1 if "Triple Top" in chart_patterns else 0,
-            'triple_bottom': 1 if "Triple Bottom" in chart_patterns else 0,
             'head_shoulders': 1 if "Head & Shoulders" in chart_patterns else 0,
             'inv_head_shoulders': 1 if "Inv Head & Shoulders" in chart_patterns else 0,
-            'rectangle': 1 if "Rectangle" in chart_patterns else 0,
-            'cup_handle': 1 if "Cup & Handle" in chart_patterns else 0,
-            'rising_wedge': 1 if "Rising Wedge" in chart_patterns else 0,
-            'falling_wedge': 1 if "Falling Wedge" in chart_patterns else 0,
-            'ascending_triangle': 1 if "Ascending Triangle" in chart_patterns else 0,
-            'descending_triangle': 1 if "Descending Triangle" in chart_patterns else 0,
-            'broadening': 1 if "Broadening" in chart_patterns else 0,
-            'pattern_count': len(chart_patterns),
-            'pattern_strength': min(len(chart_patterns), 3) / 3,  # Normalize to 0-1
-            
-            # Candlestick patterns (15+ features)
             'hammer': 1 if last['hammer'] == 100 else 0,
             'engulfing_bull': 1 if last['engulfing'] == 100 else 0,
             'engulfing_bear': 1 if last['engulfing'] == -100 else 0,
-            'doji': 1 if last['doji'] == 100 else 0,
-            'shooting_star': 1 if last['shooting_star'] == -100 else 0,
-            'morning_star': 1 if last['morning_star'] == 100 else 0,
-            'evening_star': 1 if last['evening_star'] == -100 else 0,
-            'three_white_soldiers': 1 if last['three_white_soldiers'] == 100 else 0,
-            'three_black_crows': 1 if last['three_black_crows'] == -100 else 0,
-            'marubozu_bull': 1 if last['marubozu'] == 100 else 0,
-            'marubozu_bear': 1 if last['marubozu'] == -100 else 0,
-            'harami_bull': 1 if last['harami'] > 0 else 0,
-            'harami_bear': 1 if last['harami'] < 0 else 0,
-            'piercing': 1 if last['piercing'] > 0 else 0,
-            'dark_cloud': 1 if last['dark_cloud_cover'] < 0 else 0,
-            'inside_bar': 1 if last['inside_bar'] else 0,
-            'outside_bar': 1 if last['outside_bar'] else 0,
             
-            # SMC features (10+ features)
+            # Market structure
             'bos_up': 1 if choch == "up_bos" else 0,
             'bos_down': 1 if choch == "down_bos" else 0,
-            'fvg_bullish': 1 if fvg and fvg[-1][0] == "bullish" else 0,
-            'fvg_bearish': 1 if fvg and fvg[-1][0] == "bearish" else 0,
-            'fvg_count': len(fvg) if fvg else 0,
-            'near_resistance': 1 if any(abs(last['close']-lvl)/last['close']<0.01 for lvl in sr_levels if lvl > last['close']) else 0,
             'near_support': 1 if any(abs(last['close']-lvl)/last['close']<0.01 for lvl in sr_levels if lvl < last['close']) else 0,
-            'above_key_level': len([lvl for lvl in sr_levels if lvl < last['close']]),
-            'below_key_level': len([lvl for lvl in sr_levels if lvl > last['close']]),
-            'sr_zone_strength': min(len(sr_levels), 10) / 10,  # Normalize to 0-1
-            
-            # Volume features (8+ features)
-            'vol_spike': 1 if last['vol_spike'] else 0,
-            'obv_trend': 1 if last['obv'] > prev['obv'] else 0,
-            'volume_trend_5': 1 if df['volume'].tail(5).mean() > df['volume'].tail(10).mean() else 0,
-            'volume_above_avg': 1 if last['vol_ratio'] > 1.5 else 0,
-            'cmf_bullish': 1 if last['cmf'] > 0.1 else 0,
-            'cmf_bearish': 1 if last['cmf'] < -0.1 else 0,
-            'mfi_oversold': 1 if last['mfi'] < 20 else 0,
-            'mfi_overbought': 1 if last['mfi'] > 80 else 0,
-            
-            # Oscillator features (10+ features)
-            'rsi_oversold': 1 if last['rsi'] < 30 else 0,
-            'rsi_overbought': 1 if last['rsi'] > 70 else 0,
-            'rsi_divergence': 1 if last['rsi'] > prev['rsi'] and last['close'] < prev['close'] else 0,
-            'stoch_oversold': 1 if last['stoch_k'] < 20 else 0,
-            'stoch_overbought': 1 if last['stoch_k'] > 80 else 0,
-            'stoch_crossover': 1 if last['stoch_k'] > last['stoch_d'] and prev['stoch_k'] <= prev['stoch_d'] else 0,
-            'williams_oversold': 1 if last['williams_r'] > -20 else 0,
-            'williams_overbought': 1 if last['williams_r'] < -80 else 0,
-            'cci_oversold': 1 if last['cci'] < -100 else 0,
-            'cci_overbought': 1 if last['cci'] > 100 else 0,
-            
-            # Market structure features (5+ features)
-            'trend_strength': min(abs(last['adx']), 100) / 100,  # Normalize to 0-1
-            'volatility_percentile': min(last['atr_pct'], 10) / 10,  # Normalize to 0-1
-            'bb_squeeze': 1 if last['bb_width'] < df['bb_width'].rolling(20).mean().iloc[-1] * 0.8 else 0,
-            'price_extreme': 1 if last['bb_position'] > 0.9 or last['bb_position'] < 0.1 else 0,
-            'range_expansion': 1 if last['range_pct'] > df['range_pct'].rolling(20).mean().iloc[-1] * 1.5 else 0,
+            'near_resistance': 1 if any(abs(last['close']-lvl)/last['close']<0.01 for lvl in sr_levels if lvl > last['close']) else 0,
         }
         
         return features
@@ -564,10 +522,10 @@ class CompleteCryptoMLClassifier:
         
         return np.array(X), np.array(y)
     
-    def train_all_models(self, X, y):
-        """Train all three ML models and select the best one"""
-        if len(X) < 50:
-            print(f"[ML] Not enough training data: {len(X)} samples. Need at least 50.")
+    def train_model(self, X, y):
+        """Train and select best model with hyperparameter tuning"""
+        if len(X) < 100:
+            print(f"[ML] Not enough training data: {len(X)} samples. Need at least 100.")
             return False
         
         try:
@@ -579,102 +537,57 @@ class CompleteCryptoMLClassifier:
             X_train_scaled = scaler.fit_transform(X_train)
             X_test_scaled = scaler.transform(X_test)
             
-            # Define all models to train
-            models_to_train = {
-                'RandomForest': RandomForestClassifier(
-                    n_estimators=200,
-                    max_depth=15,
-                    min_samples_split=10,
-                    min_samples_leaf=5,
-                    random_state=42,
-                    n_jobs=-1
-                ),
-                'GradientBoosting': GradientBoostingClassifier(
-                    n_estimators=150,
-                    max_depth=8,
-                    learning_rate=0.1,
-                    min_samples_split=10,
-                    random_state=42
-                ),
-                'XGBoost': xgb.XGBClassifier(
-                    n_estimators=150,
-                    max_depth=8,
-                    learning_rate=0.1,
-                    random_state=42,
-                    eval_metric='logloss',
-                    use_label_encoder=False
-                )
+            # Train XGBoost with optimized parameters
+            model = xgb.XGBClassifier(
+                n_estimators=200,
+                max_depth=7,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                random_state=42,
+                eval_metric='logloss',
+                use_label_encoder=False
+            )
+            
+            print("[ML] Training XGBoost model...")
+            model.fit(X_train_scaled, y_train)
+            
+            # Evaluate
+            train_score = model.score(X_train_scaled, y_train)
+            test_score = model.score(X_test_scaled, y_test)
+            cv_scores = cross_val_score(model, X_train_scaled, y_train, cv=5)
+            
+            y_pred = model.predict(X_test_scaled)
+            y_pred_proba = model.predict_proba(X_test_scaled)[:, 1]
+            auc_score = roc_auc_score(y_test, y_pred_proba)
+            
+            # Store performance
+            self.performance_history = {
+                'train_score': train_score,
+                'test_score': test_score,
+                'cv_mean': cv_scores.mean(),
+                'cv_std': cv_scores.std(),
+                'auc_score': auc_score
             }
             
-            best_model = None
-            best_score = 0
+            print(f"[ML] XGBoost Results:")
+            print(f"    Train: {train_score:.3f}, Test: {test_score:.3f}")
+            print(f"    CV: {cv_scores.mean():.3f}±{cv_scores.std():.3f}, AUC: {auc_score:.3f}")
             
-            print("[ML] Training and comparing all models...")
-            
-            for name, model in models_to_train.items():
-                try:
-                    print(f"[ML] Training {name}...")
-                    
-                    # Train model
-                    model.fit(X_train_scaled, y_train)
-                    
-                    # Evaluate
-                    train_score = model.score(X_train_scaled, y_train)
-                    test_score = model.score(X_test_scaled, y_test)
-                    cv_scores = cross_val_score(model, X_train_scaled, y_train, cv=5)
-                    
-                    y_pred = model.predict(X_test_scaled)
-                    try:
-                        y_pred_proba = model.predict_proba(X_test_scaled)[:, 1]
-                        auc_score = roc_auc_score(y_test, y_pred_proba)
-                    except:
-                        auc_score = 0
-                    
-                    # Store performance
-                    self.performance_history[name] = {
-                        'train_score': train_score,
-                        'test_score': test_score,
-                        'cv_mean': cv_scores.mean(),
-                        'cv_std': cv_scores.std(),
-                        'auc_score': auc_score
-                    }
-                    
-                    print(f"[ML] {name} Results:")
-                    print(f"    Train: {train_score:.3f}, Test: {test_score:.3f}")
-                    print(f"    CV: {cv_scores.mean():.3f}±{cv_scores.std():.3f}, AUC: {auc_score:.3f}")
-                    
-                    # Select best model based on combined score (CV + test score)
-                    combined_score = (cv_scores.mean() + test_score) / 2
-                    if combined_score > best_score and test_score > 0.55:  # Minimum threshold
-                        best_score = combined_score
-                        best_model = (name, model, scaler)
-                        self.best_model_name = name
-                    
-                except Exception as e:
-                    print(f"[ML] Error training {name}: {e}")
-            
-            if best_model:
-                model_name, model, scaler = best_model
+            # Only keep if meets minimum threshold
+            if test_score > 0.6 and auc_score > 0.65:
                 self.models['best'] = model
                 self.scalers['best'] = scaler
+                self.best_model_name = "XGBoost"
+                self.last_retrained = time.time()
                 
-                print(f"\n[ML] 🏆 Best Model: {model_name} (Score: {best_score:.3f})")
+                print(f"\n[ML] 🏆 Model trained successfully (Score: {test_score:.3f})")
                 
-                # Detailed evaluation of best model
-                y_pred = model.predict(X_test_scaled)
-                
-                print(f"\n[ML] Detailed {model_name} Performance:")
-                print("Classification Report:")
-                print(classification_report(y_test, y_pred))
-                
-                print("\nConfusion Matrix:")
-                print(confusion_matrix(y_test, y_pred))
-                
-                # Feature importance (if available)
+                # Feature importance
                 if hasattr(model, 'feature_importances_') and len(self.feature_names) > 0:
                     importances = model.feature_importances_
                     indices = np.argsort(importances)[::-1]
-                    print(f"\n[ML] Top 10 Most Important Features for {model_name}:")
+                    print(f"\n[ML] Top 10 Most Important Features:")
                     for i in range(min(10, len(indices))):
                         feature_idx = indices[i]
                         if feature_idx < len(self.feature_names):
@@ -682,7 +595,7 @@ class CompleteCryptoMLClassifier:
                 
                 return True
             else:
-                print("[ML] No model met the minimum performance threshold")
+                print("[ML] Model did not meet performance threshold")
                 return False
                 
         except Exception as e:
@@ -697,7 +610,7 @@ class CompleteCryptoMLClassifier:
         try:
             feature_vector = []
             if isinstance(features, dict):
-                # Convert dict to feature vector (ensure consistent ordering)
+                # Convert dict to feature vector
                 for name in self.feature_names:
                     value = features.get(name, 0)
                     if isinstance(value, (int, float)) and not np.isnan(value):
@@ -722,131 +635,114 @@ class CompleteCryptoMLClassifier:
             print(f"[ML] Prediction error: {e}")
             return 0.5, 0
     
-    def save_models(self, filepath='complete_crypto_ml_models.pkl'):
-        """Save all trained models"""
+    def save_model(self, filepath='optimized_crypto_ml_model.pkl'):
+        """Save trained model"""
         try:
             model_data = {
-                'models': self.models,
-                'scalers': self.scalers,
+                'model': self.models.get('best'),
+                'scaler': self.scalers.get('best'),
                 'feature_names': self.feature_names,
-                'best_model_name': self.best_model_name,
-                'performance_history': self.performance_history
+                'performance': self.performance_history,
+                'last_retrained': self.last_retrained
             }
             with open(filepath, 'wb') as f:
                 pickle.dump(model_data, f)
-            print(f"[ML] All models saved to {filepath}")
+            print(f"[ML] Model saved to {filepath}")
             return True
         except Exception as e:
-            print(f"[ML] Error saving models: {e}")
+            print(f"[ML] Error saving model: {e}")
             return False
     
-    def load_models(self, filepath='complete_crypto_ml_models.pkl'):
-        """Load pre-trained models"""
+    def load_model(self, filepath='optimized_crypto_ml_model.pkl'):
+        """Load pre-trained model"""
         try:
             with open(filepath, 'rb') as f:
                 model_data = pickle.load(f)
             
-            self.models = model_data.get('models', {})
-            self.scalers = model_data.get('scalers', {})
+            self.models['best'] = model_data.get('model')
+            self.scalers['best'] = model_data.get('scaler')
             self.feature_names = model_data.get('feature_names', [])
-            self.best_model_name = model_data.get('best_model_name', 'Unknown')
-            self.performance_history = model_data.get('performance_history', {})
+            self.performance_history = model_data.get('performance', {})
+            self.last_retrained = model_data.get('last_retrained', 0)
             
-            print(f"[ML] Models loaded from {filepath}")
-            print(f"[ML] Best model: {self.best_model_name}")
-            if self.best_model_name in self.performance_history:
-                perf = self.performance_history[self.best_model_name]
-                print(f"[ML] Performance - Test: {perf.get('test_score', 0):.3f}, AUC: {perf.get('auc_score', 0):.3f}")
+            print(f"[ML] Model loaded from {filepath}")
+            if self.performance_history:
+                print(f"[ML] Performance - Test: {self.performance_history.get('test_score', 0):.3f}, AUC: {self.performance_history.get('auc_score', 0):.3f}")
             return True
         except Exception as e:
-            print(f"[ML] Error loading models: {e}")
+            print(f"[ML] Error loading model: {e}")
             return False
 
-# Initialize complete ML classifier
-ml_classifier = CompleteCryptoMLClassifier()
+# Initialize optimized ML classifier
+ml_classifier = OptimizedCryptoMLClassifier()
 
 def simulate_historical_outcomes():
-    """Simulate historical outcomes for demonstration (replace with real data)"""
+    """Simulate historical outcomes for demonstration"""
     historical_signals = []
     np.random.seed(42)
     
-    for i in range(500):  # 500 historical signals
-        # Create synthetic features that mirror real features
+    for i in range(1000):  # 1000 historical signals
         features = {
-            'rsi': np.random.uniform(20, 80),
-            'macd': np.random.uniform(-0.1, 0.1),
-            'bb_position': np.random.uniform(0, 1),
-            'adx': np.random.uniform(10, 50),
-            'vol_ratio': np.random.uniform(0.5, 3.0),
             'ema_alignment': np.random.choice([-1, 0, 1]),
-            'momentum_1': np.random.uniform(-0.05, 0.05),
-            'double_bottom': np.random.choice([0, 1], p=[0.9, 0.1]),
-            'hammer': np.random.choice([0, 1], p=[0.95, 0.05]),
-            'bos_up': np.random.choice([0, 1], p=[0.8, 0.2]),
-            'near_support': np.random.choice([0, 1], p=[0.7, 0.3]),
-            'vol_spike': np.random.choice([0, 1], p=[0.8, 0.2]),
-            'stoch_oversold': np.random.choice([0, 1], p=[0.85, 0.15]),
-            'trend_strength': np.random.uniform(0, 1),
-            'volatility_percentile': np.random.uniform(0, 1),
-            # Add more features to match the comprehensive feature set
-            'rsi_fast': np.random.uniform(20, 80),
-            'rsi_slow': np.random.uniform(20, 80),
-            'macds': np.random.uniform(-0.1, 0.1),
+            'golden_cross': np.random.choice([0, 1], p=[0.95, 0.05]),
+            'death_cross': np.random.choice([0, 1], p=[0.95, 0.05]),
+            'price_vs_ema200': np.random.uniform(-0.1, 0.1),
+            'adx': np.random.uniform(10, 50),
+            'rsi': np.random.uniform(20, 80),
             'macd_hist': np.random.uniform(-0.05, 0.05),
+            'atr_pct': np.random.uniform(0.5, 5),
+            'vol_ratio': np.random.uniform(0.5, 3.0),
+            'vol_spike': np.random.choice([0, 1], p=[0.8, 0.2]),
+            'bb_position': np.random.uniform(0, 1),
+            'body_size': np.random.uniform(0, 0.1),
+            'buying_pressure': np.random.uniform(0.3, 0.7),
+            'double_top': np.random.choice([0, 1], p=[0.9, 0.1]),
+            'double_bottom': np.random.choice([0, 1], p=[0.9, 0.1]),
+            'head_shoulders': np.random.choice([0, 1], p=[0.95, 0.05]),
+            'inv_head_shoulders': np.random.choice([0, 1], p=[0.95, 0.05]),
+            'hammer': np.random.choice([0, 1], p=[0.95, 0.05]),
+            'engulfing_bull': np.random.choice([0, 1], p=[0.95, 0.05]),
+            'engulfing_bear': np.random.choice([0, 1], p=[0.95, 0.05]),
+            'bos_up': np.random.choice([0, 1], p=[0.9, 0.1]),
+            'bos_down': np.random.choice([0, 1], p=[0.9, 0.1]),
+            'near_support': np.random.choice([0, 1], p=[0.7, 0.3]),
+            'near_resistance': np.random.choice([0, 1], p=[0.7, 0.3]),
         }
         
-        # Add remaining features with default values
-        for feature_name in [
-            'bb_width', 'stoch_k', 'stoch_d', 'williams_r', 'atr_pct', 'volatility',
-            'cmf', 'mfi', 'roc', 'cci', 'dmp', 'dmn', 'body_size', 'upper_shadow',
-            'lower_shadow', 'range_pct', 'buying_pressure', 'selling_pressure',
-            'gap_up', 'gap_down', 'higher_high', 'lower_low', 'price_vs_ema20',
-            'price_vs_ema200', 'ema20_slope', 'momentum_5', 'price_position_range',
-            'consecutive_up', 'consecutive_down', 'macd_crossover', 'double_top',
-            'triple_top', 'triple_bottom', 'head_shoulders', 'inv_head_shoulders',
-            'rectangle', 'cup_handle', 'rising_wedge', 'falling_wedge',
-            'ascending_triangle', 'descending_triangle', 'broadening', 'pattern_count',
-            'pattern_strength', 'engulfing_bull', 'engulfing_bear', 'doji',
-            'shooting_star', 'morning_star', 'evening_star', 'three_white_soldiers',
-            'three_black_crows', 'marubozu_bull', 'marubozu_bear', 'harami_bull',
-            'harami_bear', 'piercing', 'dark_cloud', 'inside_bar', 'outside_bar',
-            'bos_down', 'fvg_bullish', 'fvg_bearish', 'fvg_count', 'near_resistance',
-            'above_key_level', 'below_key_level', 'sr_zone_strength', 'obv_trend',
-            'volume_trend_5', 'volume_above_avg', 'cmf_bullish', 'cmf_bearish',
-            'mfi_oversold', 'mfi_overbought', 'rsi_oversold', 'rsi_overbought',
-            'rsi_divergence', 'stoch_overbought', 'stoch_crossover', 'williams_oversold',
-            'williams_overbought', 'cci_oversold', 'cci_overbought', 'bb_squeeze',
-            'price_extreme', 'range_expansion'
-        ]:
-            if feature_name not in features:
-                features[feature_name] = np.random.uniform(0, 1) if 'ratio' in feature_name or 'percentile' in feature_name else np.random.choice([0, 1])
-        
-        # Simulate outcome based on feature logic (replace with real outcomes)
+        # Simulate outcome based on feature logic
         score = 0
-        if features['rsi'] < 30: score += 1
-        if features['ema_alignment'] == 1: score += 1
-        if features['double_bottom'] == 1: score += 1
+        if features['golden_cross'] == 1: score += 3
+        if features['ema_alignment'] == 1: score += 2
+        if features['double_bottom'] == 1: score += 2
         if features['hammer'] == 1: score += 1
         if features['vol_spike'] == 1: score += 1
-        if features['bos_up'] == 1: score += 1
+        if features['bos_up'] == 1: score += 2
         
-        outcome = 1 if score >= 3 and np.random.random() > 0.3 else 0
+        outcome = 1 if score >= 5 and np.random.random() > 0.3 else 0
         
         historical_signals.append({
             'features': features,
             'outcome': outcome,
-            'timestamp': time.time() - (500 - i) * 3600
+            'timestamp': time.time() - (1000 - i) * 3600
         })
     
     return historical_signals
 
-# ================== ENHANCED SIGNAL GENERATION ==================
-def enhanced_signal_score(df, direction, chart_patterns, fvg, choch, sr_levels, regime, confluence_score):
-    """Enhanced scoring with regime and confluence filters"""
+# ================== SIGNAL MANAGEMENT ==================
+def enhanced_signal_score(df, direction, chart_patterns, fvg, choch, sr_levels, regime, confluence_score, golden_cross):
+    """Enhanced scoring with golden cross integration"""
     last = df.iloc[-1]
     prev = df.iloc[-2]
     score = 0
     patterns = []
+    
+    # Golden cross bonus
+    if direction == "LONG" and golden_cross == "golden":
+        score += 25
+        patterns.append("Golden Cross")
+    elif direction == "SHORT" and golden_cross == "death":
+        score += 25
+        patterns.append("Death Cross")
     
     # Base technical score
     if direction == "LONG":
@@ -932,8 +828,8 @@ def dynamic_risk_management(df, entry, direction, regime):
     
     return sl, tps
 
-def get_enhanced_signal(df, chart_patterns, fvg, choch, sr_levels, smt_result, regime, confluence_score):
-    """Enhanced signal generation with complete ML filtering"""
+def get_enhanced_signal(df, chart_patterns, fvg, choch, sr_levels, smt_result, regime, confluence_score, golden_cross):
+    """Enhanced signal generation with ML filtering"""
     for direction in ("LONG", "SHORT"):
         # SMT filter
         if smt_result and not ((direction == "LONG" and smt_result == "bullish") or 
@@ -942,18 +838,18 @@ def get_enhanced_signal(df, chart_patterns, fvg, choch, sr_levels, smt_result, r
         
         # Calculate traditional score
         total_score, patterns = enhanced_signal_score(df, direction, chart_patterns, fvg, 
-                                                    choch, sr_levels, regime, confluence_score)
+                                                    choch, sr_levels, regime, confluence_score, golden_cross)
         
         if total_score >= CONFIG['conf_threshold']:
             last = df.iloc[-1]
             entry = last['close']
             
-            # Complete ML filtering with all three algorithms
+            # ML filtering
             if CONFIG['ml_enabled']:
-                features = ml_classifier.create_features(df, chart_patterns, fvg, choch, sr_levels)
+                features = ml_classifier.create_features(df, chart_patterns, fvg, choch, sr_levels, golden_cross)
                 ml_confidence, ml_prediction = ml_classifier.predict(features)
                 
-                print(f"[ML] {direction} signal - Model: {ml_classifier.best_model_name} | Confidence: {ml_confidence:.3f}")
+                print(f"[ML] {direction} signal - Confidence: {ml_confidence:.3f}")
                 
                 if ml_confidence < CONFIG['ml_threshold']:
                     print(f"[ML] {direction} signal filtered out (confidence: {ml_confidence:.3f} < {CONFIG['ml_threshold']})")
@@ -972,15 +868,88 @@ def get_enhanced_signal(df, chart_patterns, fvg, choch, sr_levels, smt_result, r
             return {
                 "direction": direction, "entry": entry, "sl": sl, "tps": tps,
                 "score": int(final_score), "ml_confidence": ml_confidence,
-                "ml_model": ml_classifier.best_model_name,
                 "traditional_score": total_score, "patterns": patterns,
                 "timestamp": time.time(), "smt": smt_result, "rr": rr,
                 "regime": regime, "confluence": confluence_score,
                 "fvg": str(fvg[-1]) if fvg else "None", "choch": choch,
-                "sr": sr_levels, "atr": last['atr'], "bar_ts": str(df.index[-1])
+                "sr": sr_levels, "atr": last['atr'], "bar_ts": str(df.index[-1]),
+                "golden_cross": golden_cross
             }
     
     return None
+
+# ================== LIVE DATA MONITORING ==================
+async def monitor_live_data():
+    """Continuously monitor live prices for SL/TP hits"""
+    global open_signals
+    
+    while True:
+        try:
+            # Refresh live prices
+            for symbol, _ in CONFIG["pairs"]:
+                live_price = await fetch_live_price(symbol)
+                if live_price:
+                    live_data_cache[symbol] = live_price
+            
+            # Check SL/TP for all open signals
+            current_time = time.time()
+            signals_to_remove = []
+            
+            for sig_key, signal in list(open_signals.items()):
+                symbol = sig_key.split('-')[0]
+                live_price = live_data_cache.get(symbol)
+                
+                if not live_price:
+                    continue
+                
+                # Check if signal is expired
+                if current_time - signal['timestamp'] > CONFIG['signal_lifetime_sec']:
+                    signals_to_remove.append(sig_key)
+                    await send_telegram(f"⌛ {symbol} signal expired ({signal['direction']})")
+                    update_signal_outcome(sig_key, 0)  # Mark as expired
+                    continue
+                
+                # Check SL/TP hits
+                direction = signal['direction']
+                entry = signal['entry']
+                sl = signal['sl']
+                tps = signal['tps']
+                
+                if direction == "LONG":
+                    if live_price <= sl:
+                        await send_telegram(f"📉 {symbol} LONG Stop Loss hit at {live_price:.4f}")
+                        update_signal_outcome(sig_key, 0)
+                        signals_to_remove.append(sig_key)
+                    else:
+                        for i, tp in enumerate(tps):
+                            if live_price >= tp:
+                                await send_telegram(f"📈 {symbol} LONG Take Profit #{i+1} hit at {live_price:.4f}")
+                                if i == len(tps) - 1:  # Final TP
+                                    update_signal_outcome(sig_key, 1)
+                                    signals_to_remove.append(sig_key)
+                else:  # SHORT
+                    if live_price >= sl:
+                        await send_telegram(f"📈 {symbol} SHORT Stop Loss hit at {live_price:.4f}")
+                        update_signal_outcome(sig_key, 0)
+                        signals_to_remove.append(sig_key)
+                    else:
+                        for i, tp in enumerate(tps):
+                            if live_price <= tp:
+                                await send_telegram(f"📉 {symbol} SHORT Take Profit #{i+1} hit at {live_price:.4f}")
+                                if i == len(tps) - 1:  # Final TP
+                                    update_signal_outcome(sig_key, 1)
+                                    signals_to_remove.append(sig_key)
+            
+            # Remove completed signals
+            for sig_key in set(signals_to_remove):
+                if sig_key in open_signals:
+                    del open_signals[sig_key]
+            
+            await asyncio.sleep(CONFIG['live_data_interval'])
+            
+        except Exception as e:
+            print(f"[LIVE MONITOR ERROR] {e}")
+            await asyncio.sleep(10)
 
 # ================== TELEGRAM & LOGGING ==================
 @retry(
@@ -992,7 +961,6 @@ def get_enhanced_signal(df, chart_patterns, fvg, choch, sr_levels, smt_result, r
 async def send_telegram(text):
     """Ultra-reliable Telegram message sender"""
     try:
-        # Try direct connection first
         await bot.send_message(
             chat_id=CONFIG["chat_id"],
             text=text,
@@ -1000,17 +968,10 @@ async def send_telegram(text):
             write_timeout=30,
             connect_timeout=30
         )
-    except httpx.ConnectError as e:
-        print(f"Connection failed, will retry: {e}")
-        raise
-    except httpx.TimeoutException as e:
-        print(f"Timeout occurred, will retry: {e}")
-        raise
+        return True
     except Exception as e:
-        print(f"Unexpected Telegram error: {e}")
-        # Don't retry for other errors
+        print(f"Telegram error: {e}")
         return False
-    return True
 
 def log_signal(signal):
     """Log signal to file"""
@@ -1033,58 +994,62 @@ def update_signal_outcome(signal_key, outcome):
 
 # ================== MAIN MONITORING LOOP ==================
 async def monitor():
-    """Main monitoring loop with complete ML integration and heartbeat messages"""
+    """Main monitoring loop with golden cross and ML integration"""
     global open_signals, signal_history
     
-    print("[STARTUP] 🚀 Initializing Complete ML Crypto Quant Bot...")
-    print(f"[ML] Algorithms: RandomForest, GradientBoosting, XGBoost")
+    print("[STARTUP] 🚀 Initializing Enhanced Crypto Quant Bot...")
+    print(f"[ML] Optimized XGBoost classifier")
     
     # Heartbeat control
     heartbeats_sent = 0
-    CYCLE_COUNT = 0      # increments every scan
+    CYCLE_COUNT = 0
     
     # Load ML model
     if CONFIG['ml_enabled']:
-        if not ml_classifier.load_models():
-            print("[ML] No pre-trained model found. Training new models...")
+        if not ml_classifier.load_model():
+            print("[ML] No pre-trained model found. Training new model...")
             historical_signals = simulate_historical_outcomes()
             if len(historical_signals) >= 100:
                 X, y = ml_classifier.prepare_training_data(historical_signals)
-                if ml_classifier.train_all_models(X, y):
-                    ml_classifier.save_models()
+                if ml_classifier.train_model(X, y):
+                    ml_classifier.save_model()
                 else:
                     print("[ML] Model training failed. Running without ML.")
             else:
                 print("[ML] Not enough historical data for training.")
     
+    # Start live data monitoring
+    asyncio.create_task(monitor_live_data())
+    
     retrain_counter = 0
     
     while True:
-        CYCLE_COUNT += 1   # heartbeat counter
+        CYCLE_COUNT += 1
         try:
-            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting enhanced ML analysis cycle...")
+            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting analysis cycle #{CYCLE_COUNT}...")
             
             # Clean stale signals
             open_signals = clean_stale_signals(open_signals)
             
             # Periodic ML retraining
-            if CONFIG['ml_enabled'] and len(signal_history) > 50:
+            if CONFIG['ml_enabled'] and len(signal_history) > 100:
                 retrain_counter += 1
-                if retrain_counter % 48 == 0:
+                if retrain_counter % 24 == 0:  # Retrain every 24 cycles
                     print("[ML] Periodic model retraining with new data...")
                     outcomes = [s for s in signal_history if 'outcome' in s]
                     if len(outcomes) >= 100:
                         X, y = ml_classifier.prepare_training_data(outcomes)
-                        if ml_classifier.train_all_models(X, y):
-                            ml_classifier.save_models()
+                        if ml_classifier.train_model(X, y):
+                            ml_classifier.save_model()
             
-            # --- scan each pair / timeframe ---
+            # Process each pair and timeframe
             for symbol, ref_symbol in CONFIG["pairs"]:
                 for tf in CONFIG["timeframes"]:
-                    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Analyzing {symbol}-{tf}...")
                     try:
-                        df      = await fetch_ohlcv(symbol, tf)
-                        df_ref  = await  fetch_ohlcv(ref_symbol, tf)
+                        df = await fetch_ohlcv(symbol, tf)
+                        df_ref = await fetch_ohlcv(ref_symbol, tf)
+                        
+                        # Handle data alignment
                         if not df.index.equals(df_ref.index):
                             df_ref = df_ref.reindex(df.index, method='nearest').fillna(method='ffill')
                             
@@ -1092,107 +1057,76 @@ async def monitor():
                         df = add_candle_patterns(df)
                         df = order_flow_analysis(df)
                         
-                        regime            = detect_market_regime(df)
+                        # Detect key patterns and regimes
+                        regime = detect_market_regime(df)
                         confluence_score, _ = await multi_timeframe_confluence(symbol, ref_symbol)
-                        chart_patterns    = get_chart_patterns(df)
-                        fvg               = detect_fvg(df)
-                        sr_levels         = find_sr_zones(df)
-                        choch             = detect_bos_choch(df)
-                        smt               = smt_divergence(df, df_ref, window=CONFIG["smt_window"])
+                        chart_patterns = get_chart_patterns(df)
+                        fvg = detect_fvg(df)
+                        sr_levels = find_sr_zones(df)
+                        choch = detect_bos_choch(df)
+                        smt = smt_divergence(df, df_ref, window=CONFIG["smt_window"])
+                        golden_cross = detect_golden_cross(df)
                         
-                        print(f"[ANALYSIS] {symbol}-{tf}: Regime={regime}, Confluence={confluence_score}, Patterns={len(chart_patterns)}")
-                        
+                        # Generate signal
                         sig = get_enhanced_signal(df, chart_patterns, fvg, choch,
-                                                  sr_levels, smt, regime, confluence_score)
-                        price = df['close'].iloc[-1]
+                                                sr_levels, smt, regime, confluence_score, golden_cross)
                         
                         if sig:
                             sig_key = f"{symbol}-{tf}-{sig['direction']}"
                             sig['key'] = sig_key
                             bar_ts = sig['bar_ts']
                             
-                            print(f"[SIGNAL] {symbol} {tf} {sig['direction']} | Score: {sig['score']} | ML({sig['ml_model']}): {sig['ml_confidence']:.3f}")
-                            
-                            # duplicate check
+                            # Skip duplicate signals
                             if sig_key in open_signals and open_signals[sig_key].get('bar_ts') == bar_ts:
                                 continue
                             
-                            # SL / TP handler for open positions
-                            if sig_key in open_signals:
-                                signal = open_signals[sig_key]
-                                if signal['direction'] == 'LONG':
-                                    if price <= signal['sl']:
-                                        await send_telegram(f"📉 {symbol} LONG Stop Loss hit at {price:.4f} ({tf})")
-                                        update_signal_outcome(sig_key, 0)
-                                        del open_signals[sig_key]
-                                        continue
-                                    elif any(price >= tp for tp in signal['tps']):
-                                        await send_telegram(f"📈 {symbol} LONG Take Profit hit at {price:.4f} ({tf})")
-                                        update_signal_outcome(sig_key, 1)
-                                        del open_signals[sig_key]
-                                        continue
-                                else:  # SHORT
-                                    if price >= signal['sl']:
-                                        await send_telegram(f"📈 {symbol} SHORT Stop Loss hit at {price:.4f} ({tf})")
-                                        update_signal_outcome(sig_key, 0)
-                                        del open_signals[sig_key]
-                                        continue
-                                    elif any(price <= tp for tp in signal['tps']):
-                                        await send_telegram(f"📉 {symbol} SHORT Take Profit hit at {price:.4f} ({tf})")
-                                        update_signal_outcome(sig_key, 1)
-                                        del open_signals[sig_key]
-                                        continue
+                            # Add golden cross info to message
+                            cross_info = ""
+                            if golden_cross == "golden":
+                                cross_info = " | ✨ Golden Cross"
+                            elif golden_cross == "death":
+                                cross_info = " | ☠️ Death Cross"
                             
-                            # new signal
+                            print(f"[SIGNAL] {symbol} {tf} {sig['direction']} | Score: {sig['score']} | ML: {sig['ml_confidence']:.3f}{cross_info}")
+                            
+                            # Store and notify
                             open_signals[sig_key] = sig
                             signal_history.append(sig)
                             log_signal(sig)
                             
-                            tps_str    = ', '.join(f"{tp:.4f}" for tp in sig['tps'])
+                            tps_str = ', '.join(f"{tp:.4f}" for tp in sig['tps'])
                             patterns_str = ', '.join(sig['patterns'][:3]) if sig['patterns'] else "None"
                             
-                            msg = (f"🤖 ML-POWERED SIGNAL\n"
-                                   f"📊 {symbol} {tf}: {sig['direction']}\n"
-                                   f"🏆 Model: {sig['ml_model']} | 🎯 ML Confidence: {sig['ml_confidence']:.2f}\n"
-                                   f"⚡ Score: {sig['score']} (Base: {sig['traditional_score']}) | 📈 Regime: {regime}\n"
+                            msg = (f"🤖 ENHANCED SIGNAL\n"
+                                   f"📊 {symbol} {tf}: {sig['direction']}{cross_info}\n"
+                                   f"🏆 ML Confidence: {sig['ml_confidence']:.2f} | ⚡ Score: {sig['score']}\n"
                                    f"💰 Entry: {sig['entry']:.4f} | 🛑 SL: {sig['sl']:.4f}\n"
                                    f"🎯 TPs: {tps_str} | ⚡ RR: {sig['rr']}\n"
-                                   f"📋 Patterns: {patterns_str}\n"
-                                   f"🔄 Confluence: {confluence_score} | ATR: {sig['atr']:.4f}")
+                                   f"📋 Patterns: {patterns_str}")
                             
-                            if sig['smt']: msg += f"\n📊 SMT: {sig['smt']}"
-                            if sig['choch']: msg += f" | 🔄 BOS: {sig['choch']}"
+                            if sig['smt']: 
+                                msg += f"\n📊 SMT: {sig['smt']}"
                             await send_telegram(msg)
-                            
-                        else:
-                            print(f"[NO SIGNAL] {symbol}-{tf} | Regime: {regime}")
                     
                     except Exception as e:
                         print(f"[ERROR] {symbol}-{tf}: {e}")
             
-            # --------------------------------------
-            # Heartbeat / no-signal summary
-            # --------------------------------------
-            open_cnt   = len(open_signals)
-            total_cnt  = len(signal_history)
-            ml_cnt     = len([s for s in signal_history
-                              if s.get('ml_confidence', 0) > CONFIG['ml_threshold']])
+            # Send heartbeat
+            open_cnt = len(open_signals)
+            total_signals = len(signal_history)
+            ml_signals = len([s for s in signal_history if s.get('ml_confidence', 0) > CONFIG['ml_threshold']])
             
-            if open_cnt == 0:
-                msg = (f"💤 No active signals – bot scanning...\n"
-                       f"📊 Total generated: {total_cnt} | ML-filtered: {ml_cnt}\n"
-                       f"⏱️ Next scan in {CONFIG['scan_interval']}s")
-            else:
-                msg = (f"🔄 Scan complete – {open_cnt} active signal(s)\n"
-                       f"📊 Total generated: {total_cnt} | ML-filtered: {ml_cnt}")
+            if CYCLE_COUNT % 6 == 0:  # Send status every 6 cycles
+                status_msg = (f"📊 BOT STATUS\n"
+                              f"🔄 Cycle: #{CYCLE_COUNT} | ⏱ Uptime: {timedelta(seconds=int(time.time()-bot_status['last_update']))}\n"
+                              f"📈 Active Signals: {open_cnt}\n"
+                              f"📋 Total Signals: {total_signals} | 🤖 ML Signals: {ml_signals}")
+                if ml_classifier.performance_history:
+                    perf = ml_classifier.performance_history
+                    status_msg += f"\n🤖 ML Perf: Test {perf.get('test_score', 0):.3f} | AUC {perf.get('auc_score', 0):.3f}"
+                await send_telegram(status_msg)
             
-            await send_telegram(msg)
-            
-            print(f"[CYCLE COMPLETE #{CYCLE_COUNT}] Open: {open_cnt} | ML signals: {ml_cnt}/{total_cnt}")
-            if ml_classifier.best_model_name:
-                print(f"[ML STATUS] Best Model: {ml_classifier.best_model_name}")
-            
-            print(f"[SLEEP] Waiting {CONFIG['scan_interval']}s...")
+            print(f"[CYCLE COMPLETE] Open: {open_cnt} | Total: {total_signals} | Next in {CONFIG['scan_interval']}s")
             await exchange.close()
             await asyncio.sleep(CONFIG['scan_interval'])
             
@@ -1202,14 +1136,13 @@ async def monitor():
 
 # ================== MAIN ENTRY POINT ==================
 if __name__ == "__main__":
-    print("🚀 Complete ML Crypto Quant Trading Bot")
-    print("🤖 RandomForest + GradientBoosting + XGBoost")
+    print("🚀 Enhanced Crypto Quant Trading Bot")
+    print("✨ Golden Cross Detection | 🤖 Optimized ML | 📊 Live Monitoring")
     print("=" * 60)
     print(f"Pairs: {len(CONFIG['pairs'])}")
     print(f"Timeframes: {CONFIG['timeframes']}")
     print(f"ML Enabled: {CONFIG['ml_enabled']}")
-    print(f"ML Threshold: {CONFIG['ml_threshold']}")
-    print(f"Scan Interval: {CONFIG['scan_interval']}s")
+    print(f"Live Data Interval: {CONFIG['live_data_interval']}s")
     print("=" * 60)
     
     # Start Flask health endpoint
