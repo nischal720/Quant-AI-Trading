@@ -896,7 +896,7 @@ class OptimizedCryptoMLClassifier:
             sr_levels = find_sr_zones(window)
             golden_cross = detect_golden_cross(window)
             signal = get_enhanced_signal(window, chart_patterns, fvg, choch, sr_levels,
-                                         detect_market_regime(window), 0, golden_cross)
+                                         detect_market_regime(window), 0, golden_cross,symbol)
             if signal:
                 future_price = df['close'].iloc[i+50]
                 outcome = 1 if (signal['direction'] == "LONG" and future_price > signal['entry']) or \
@@ -1080,11 +1080,11 @@ def dynamic_risk_management(df: pd.DataFrame, entry: float, direction: str, regi
     tps = [entry + tp_mult * atr * i for i in (1, 1.5, 2)] if direction == "LONG" else [entry - tp_mult * atr * i for i in (1, 1.5, 2)]
     return sl, tps
 
-def get_enhanced_signal(df: pd.DataFrame, chart_patterns: List[str], fvg: List, choch: str, sr_levels: List[float], regime: str, confluence_score: int, golden_cross: str) -> Optional[Dict]:
+def get_enhanced_signal(df: pd.DataFrame, chart_patterns: List[str], fvg: List, choch: str, sr_levels: List[float], regime: str, confluence_score: int, golden_cross: str,symbol: str) -> Optional[Dict]:
     """Generate enhanced trading signal."""
     for direction in ("LONG", "SHORT"):
         total_score, patterns = enhanced_signal_score(df, direction, chart_patterns, fvg, choch, sr_levels, regime, confluence_score, golden_cross)
-        logger.info(f"{direction} Score: {total_score}, Patterns: {patterns}")
+        logger.info(f"{symbol}:{direction} Score: {total_score}, Patterns: {patterns}")
         if total_score >= CONFIG['conf_threshold']:
             last = df.iloc[-1]
             entry = last['close']
@@ -1275,7 +1275,7 @@ async def monitor():
                         sr_levels = find_sr_zones(df)
                         choch = detect_bos_choch(df)
                         golden_cross = detect_golden_cross(df)
-                        sig = get_enhanced_signal(df, chart_patterns, fvg, choch, sr_levels, regime, confluence_score, golden_cross)
+                        sig = get_enhanced_signal(df, chart_patterns, fvg, choch, sr_levels, regime, confluence_score, golden_cross, symbol)
                         if sig:
                             sig_key = f"{symbol}-{tf}-{sig['direction']}"
                             sig['key'] = sig_key
