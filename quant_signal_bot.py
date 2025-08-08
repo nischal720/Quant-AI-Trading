@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-
 import os, sys, time, asyncio, threading, json
 import ccxt.async_support as ccxt_async
 import pandas as pd
@@ -24,7 +22,6 @@ from typing import List, Dict, Optional, Tuple, Callable
 from collections import defaultdict
 import re
 from functools import wraps
-from aiohttp import web
 
 warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -32,8 +29,8 @@ logger = logging.getLogger(__name__)
 
 # Configuration with defaults and validation
 CONFIG = {
-    "telegram_token": os.environ.get("BOT_TOKEN", "8409294817:AAE-ItEJXi-1iyvx8iqx04S3EXvpMrEoxio"),
-    "chat_id": os.environ.get("CHANNEL_ID", "1554511072"),
+    "telegram_token": os.environ.get("BOT_TOKEN", "YOUR_TELEGRAM_TOKEN_HERE"),
+    "chat_id": os.environ.get("CHANNEL_ID", "YOUR_CHAT_ID_HERE"),
     "exchanges": {
         "binance": {
             "apiKey": os.environ.get('BINANCE_API_KEY', ''),
@@ -56,8 +53,8 @@ CONFIG = {
         }
     },
     "pairs": ["BNB/USDT:USDT", "XRP/USDT:USDT", "SOL/USDT:USDT", "TON/USDT:USDT"],
-    "timeframes": ["1m", "5m", "15m", "1h", "4h", "1d"],
-    "conf_threshold": 85,
+    "timeframes": ["15m", "1h", "4h", "1d"],
+    "conf_threshold": 50,  # Lowered for testing
     "atr_sl_mult": 1.8,
     "atr_tp_mult": 2.5,
     "adx_threshold": 25,
@@ -72,12 +69,12 @@ CONFIG = {
     "order_flow_analysis": True,
     "scan_interval": 120,
     "live_data_interval": 15,
-    "cache_ttl":300,
+    "cache_ttl": 300,
     "encryption_key": os.environ.get("ENCRYPTION_KEY", Fernet.generate_key().decode()),
     "flask_rate_limit": {"requests": 100, "window": 60},
     "telegram_rate_limit": {"requests": 20, "window": 60},
-    "indicator_plugins": ["ema", "rsi", "macd", "bbands", "stoch", "willr", "adx", "atr", "volatility", "obv", "cmf", "mfi", "candle_patterns", "order_flow"],
-    "scoring_plugins": ["ema_alignment", "golden_cross", "rsi", "macd", "stoch", "adx", "volume", "bbands", "order_flow", "chart_patterns", "smc"]
+    "indicator_plugins": ["ema", "rsi", "macd", "bbands", "stoch", "willr", "adx", "atr", "volatility", "obv", "cmf", "mfi", "candle_patterns", "order_flow", "vwap"],
+    "scoring_plugins": ["ema_alignment", "golden_cross", "rsi", "macd", "stoch", "adx", "volume", "bbands", "order_flow", "chart_patterns", "smc", "vwap"]
 }
 
 # Global state
@@ -95,13 +92,11 @@ flask_rate_limits = defaultdict(lambda: {"count": 0, "reset_time": 0})
 telegram_rate_limits = defaultdict(lambda: {"count": 0, "reset_time": 0})
 
 # Initialize components
-bot = Bot(token='{}'.format(CONFIG["telegram_token"]))
-
+bot = Bot(token=CONFIG["telegram_token"])
 app = Flask(__name__)
 
 # ================== SECURITY ENHANCEMENTS ==================
 def rate_limit(limit_type: str):
-    """Rate limit decorator for Flask and Telegram."""
     def decorator(f):
         @wraps(f)
         async def wrapped(*args, **kwargs):
@@ -126,14 +121,12 @@ def rate_limit(limit_type: str):
     return decorator
 
 def sanitize_string(text: str) -> str:
-    """Sanitize input string to prevent injection attacks."""
     if not isinstance(text, str):
         return ""
-    # Remove HTML tags, excessive whitespace, and potentially malicious characters
     text = re.sub(r'<[^>]+>', '', text)
     text = re.sub(r'\s+', ' ', text.strip())
     text = re.sub(r'[^\w\s.,:;@#$%^&*()_+-=]', '', text)
-    return text[:500]  # Limit length to prevent abuse
+    return text[:500]
 
 @app.route('/ping')
 @rate_limit("flask")
@@ -154,13 +147,12 @@ def run_flask():
 
 # ================== CONFIG VALIDATION ==================
 def validate_config():
-    """Validate configuration parameters."""
     required = ["telegram_token", "chat_id", "pairs", "timeframes", "indicator_plugins", "scoring_plugins"]
     for key in required:
         if not CONFIG[key] or (isinstance(CONFIG[key], str) and CONFIG[key].startswith("<")):
             logger.error(f"Missing or invalid {key} in configuration")
             sys.exit(1)
-    if not all(isinstance(p, str) and '/' in p for p in CONFIG["pairs"]):
+    if not all(isinstance(p, str) and p.endswith('USDT') for p in CONFIG["pairs"]):
         logger.error("Invalid trading pairs format")
         sys.exit(1)
     if not all(tf in ["1m", "5m", "15m", "1h", "4h", "1d"] for tf in CONFIG["timeframes"]):
@@ -170,21 +162,17 @@ def validate_config():
 
 # ================== PLUGIN SYSTEM ==================
 class IndicatorPlugin:
-    """Base class for indicator plugins."""
     def __init__(self, name: str):
         self.name = name
 
     def compute(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Compute indicators and add to DataFrame."""
         raise NotImplementedError
 
 class ScoringPlugin:
-    """Base class for scoring plugins."""
     def __init__(self, name: str):
         self.name = name
 
     def score(self, df: pd.DataFrame, direction: str, **context) -> Tuple[int, List[str]]:
-        """Calculate score and patterns for a given direction."""
         raise NotImplementedError
 
 # Indicator Plugins
@@ -294,6 +282,12 @@ class OrderFlowPlugin(IndicatorPlugin):
         df['lower_rejection'] = (df['low'] == df['low'].rolling(5).min()) & (df['close'] > df['low'] * 1.02)
         df['buying_pressure'] = (df['close'] - df['low']) / (df['high'] - df['low'])
         df['selling_pressure'] = (df['high'] - df['close']) / (df['high'] - df['low'])
+        return df
+
+class VWAPPlugin(IndicatorPlugin):
+    def compute(self, df: pd.DataFrame) -> pd.DataFrame:
+        typical_price = (df['high'] + df['low'] + df['close']) / 3
+        df['vwap'] = (typical_price * df['volume']).cumsum() / df['volume'].cumsum()
         return df
 
 class CustomIndicatorPlugin(IndicatorPlugin):
@@ -448,13 +442,17 @@ class SMCPluginScoring(ScoringPlugin):
             patterns.append("SR Zone")
         return score, patterns
 
-class CustomScoringPlugin(ScoringPlugin):
-    def __init__(self, name: str, score_fn: Callable[[pd.DataFrame, str, Dict], Tuple[int, List[str]]]):
-        super().__init__(name)
-        self.score_fn = score_fn
-
+class VWAPPluginScoring(ScoringPlugin):
     def score(self, df: pd.DataFrame, direction: str, **context) -> Tuple[int, List[str]]:
-        return self.score_fn(df, direction, **context)
+        last = df.iloc[-1]
+        score, patterns = 0, []
+        if direction == "LONG" and last.get('vwap') and last['close'] > last['vwap']:
+            score += 10
+            patterns.append("Above VWAP")
+        elif direction == "SHORT" and last.get('vwap') and last['close'] < last['vwap']:
+            score += 10
+            patterns.append("Below VWAP")
+        return score, patterns
 
 # Plugin Registry
 INDICATOR_PLUGINS = {
@@ -471,7 +469,8 @@ INDICATOR_PLUGINS = {
     "cmf": CMFPlugin("cmf"),
     "mfi": MFIPlugin("mfi"),
     "candle_patterns": CandlePatternsPlugin("candle_patterns"),
-    "order_flow": OrderFlowPlugin("order_flow")
+    "order_flow": OrderFlowPlugin("order_flow"),
+    "vwap": VWAPPlugin("vwap")
 }
 
 SCORING_PLUGINS = {
@@ -485,49 +484,12 @@ SCORING_PLUGINS = {
     "bbands": BollingerBandsPluginScoring("bbands"),
     "order_flow": OrderFlowPluginScoring("order_flow"),
     "chart_patterns": ChartPatternsPluginScoring("chart_patterns"),
-    "smc": SMCPluginScoring("smc")
+    "smc": SMCPluginScoring("smc"),
+    "vwap": VWAPPluginScoring("vwap")
 }
-
-def register_custom_indicator(name: str, compute_fn: Callable[[pd.DataFrame], pd.DataFrame]):
-    """Register a custom indicator plugin."""
-    INDICATOR_PLUGINS[name] = CustomIndicatorPlugin(name, compute_fn)
-    if name not in CONFIG["indicator_plugins"]:
-        CONFIG["indicator_plugins"].append(name)
-    logger.info(f"Registered custom indicator: {name}")
-
-def register_custom_scoring(name: str, score_fn: Callable[[pd.DataFrame, str, Dict], Tuple[int, List[str]]]):
-    """Register a custom scoring plugin."""
-    SCORING_PLUGINS[name] = CustomScoringPlugin(name, score_fn)
-    if name not in CONFIG["scoring_plugins"]:
-        CONFIG["scoring_plugins"].append(name)
-    logger.info(f"Registered custom scoring rule: {name}")
-
-# Example custom indicator and scoring rule
-def custom_vwap_indicator(df: pd.DataFrame) -> pd.DataFrame:
-    """Example custom VWAP indicator."""
-    typical_price = (df['high'] + df['low'] + df['close']) / 3
-    df['vwap'] = (typical_price * df['volume']).cumsum() / df['volume'].cumsum()
-    return df
-
-def custom_vwap_scoring(df: pd.DataFrame, direction: str, **context) -> Tuple[int, List[str]]:
-    """Example custom VWAP scoring rule."""
-    last = df.iloc[-1]
-    score, patterns = 0, []
-    if direction == "LONG" and last['close'] > last['vwap']:
-        score += 10
-        patterns.append("Above VWAP")
-    elif direction == "SHORT" and last['close'] < last['vwap']:
-        score += 10
-        patterns.append("Below VWAP")
-    return score, patterns
-
-# Register custom plugins
-register_custom_indicator("vwap", custom_vwap_indicator)
-register_custom_scoring("vwap", custom_vwap_scoring)
 
 # ================== DATA FETCHING ==================
 async def test_exchange_connectivity(exchange: ccxt_async.Exchange, url: str) -> bool:
-    """Test connectivity to an exchange API."""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(f"{url}/exchangeInfo", ssl=False, timeout=10) as response:
@@ -542,7 +504,6 @@ async def test_exchange_connectivity(exchange: ccxt_async.Exchange, url: str) ->
 
 @retry(wait=wait_exponential(multiplier=2, min=2, max=30), stop=stop_after_attempt(15))
 async def validate_symbols(exchange: ccxt_async.Exchange) -> List[str]:
-    """Validate trading symbols for perpetual futures and refresh invalid_symbols."""
     try:
         await exchange.load_markets(reload=True)
         markets = exchange.markets
@@ -564,7 +525,7 @@ async def validate_symbols(exchange: ccxt_async.Exchange) -> List[str]:
                 invalid_symbols.add(symbol)
         if not valid_pairs:
             logger.error("No valid trading symbols found")
-            return []
+        logger.info(f"Valid pairs: {valid_pairs}")
         return valid_pairs
     except Exception as e:
         logger.error(f"Failed to validate symbols: {str(e)}")
@@ -574,19 +535,19 @@ async def validate_symbols(exchange: ccxt_async.Exchange) -> List[str]:
 
 @retry(wait=wait_exponential(multiplier=2, min=2, max=30), stop=stop_after_attempt(15))
 async def fetch_ohlcv_batch(exchange: ccxt_async.Exchange, symbols: List[str], timeframe: str, limit: int = 300) -> Dict[str, Optional[pd.DataFrame]]:
-    """Fetch OHLCV data for multiple symbols in batch."""
     results = {}
     async with semaphore:
         tasks = [fetch_ohlcv_single(exchange, symbol, timeframe, limit) for symbol in symbols if symbol not in invalid_symbols]
+        logger.info(f"Fetching data for {len(tasks)} symbols (skipped {len(invalid_symbols)} invalid symbols)")
         ohlcv_data = await asyncio.gather(*tasks, return_exceptions=True)
         for symbol, data in zip([s for s in symbols if s not in invalid_symbols], ohlcv_data):
             results[symbol] = data if not isinstance(data, Exception) else None
         return results
 
 async def fetch_ohlcv_single(exchange: ccxt_async.Exchange, symbol: str, timeframe: str, limit: int = 300) -> Optional[pd.DataFrame]:
-    """Fetch OHLCV data for a single symbol with caching."""
     cache_key = f"{symbol}-{timeframe}"
     if cache_key in ohlcv_cache and time.time() - ohlcv_cache[cache_key]["timestamp"] < CONFIG["cache_ttl"]:
+        logger.info(f"Using cached OHLCV data for {symbol}-{timeframe}")
         return ohlcv_cache[cache_key]["data"]
     
     try:
@@ -595,6 +556,7 @@ async def fetch_ohlcv_single(exchange: ccxt_async.Exchange, symbol: str, timefra
         df['ts'] = pd.to_datetime(df['ts'], unit='ms')
         df.set_index('ts', inplace=True)
         ohlcv_cache[cache_key] = {"data": df, "timestamp": time.time()}
+        logger.info(f"Fetched {len(df)} rows for {symbol}-{timeframe}")
         return df
     except ccxt_async.RateLimitExceeded as e:
         logger.error(f"Rate limit exceeded for {symbol} {timeframe}: {str(e)}")
@@ -611,7 +573,6 @@ async def fetch_ohlcv_single(exchange: ccxt_async.Exchange, symbol: str, timefra
         return None
 
 async def fetch_live_price(exchange: ccxt_async.Exchange, symbol: str) -> Optional[float]:
-    """Fetch live price with caching."""
     if symbol in invalid_symbols:
         logger.info(f"Skipping invalid symbol: {symbol}")
         return None
@@ -625,7 +586,6 @@ async def fetch_live_price(exchange: ccxt_async.Exchange, symbol: str) -> Option
 
 # ================== INDICATOR AND SCORING MANAGEMENT ==================
 def apply_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Apply enabled indicator plugins to DataFrame."""
     df = df.copy()
     for plugin_name in CONFIG["indicator_plugins"]:
         if plugin_name in INDICATOR_PLUGINS:
@@ -639,11 +599,14 @@ def apply_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['range_pct'] = (df['high'] - df['low']) / df['close']
     df['roc'] = pta.roc(df['close'], length=10)
     df['cci'] = pta.cci(df['high'], df['low'], df['close'])
+    key_columns = ['ema20', 'ema50', 'ema200', 'rsi', 'macd', 'stoch_k', 'adx', 'volume', 'bb_position', 'buying_pressure']
+    for col in key_columns:
+        if col in df and df[col].isnull().all():
+            logger.warning(f"All values in {col} are NaN")
     return df.fillna(method='ffill').fillna(0)
 
 # ================== GOLDEN CROSS DETECTION ==================
 def detect_golden_cross(df: pd.DataFrame) -> Optional[str]:
-    """Detect golden/death cross."""
     if len(df) < 2 or 'ema50' not in df or 'ema200' not in df:
         return None
     prev_ema50, prev_ema200 = df['ema50'].iloc[-2], df['ema200'].iloc[-2]
@@ -656,12 +619,10 @@ def detect_golden_cross(df: pd.DataFrame) -> Optional[str]:
 
 # ================== CHART PATTERN DETECTION ==================
 def get_chart_patterns(df: pd.DataFrame) -> List[str]:
-    """Detect all chart patterns."""
     patterns = []
     tol, lookback = 0.01, 20
     window, lookback_long = 20, 40
     
-    # Double Top/Bottom
     close = df['close']
     peaks = (close.shift(1) < close) & (close.shift(-1) < close)
     valleys = (close.shift(1) > close) & (close.shift(-1) > close)
@@ -672,7 +633,6 @@ def get_chart_patterns(df: pd.DataFrame) -> List[str]:
     if len(valley_idxs) == 2 and abs(close.loc[valley_idxs[0]] - close.loc[valley_idxs[1]]) / close.loc[valley_idxs[0]] < tol:
         patterns.append("Double Bottom")
     
-    # Triple Top/Bottom
     peak_idxs = close[peaks].index[-3:]
     valley_idxs = close[valleys].index[-3:]
     if len(peak_idxs) == 3:
@@ -684,39 +644,33 @@ def get_chart_patterns(df: pd.DataFrame) -> List[str]:
         if abs(v1-v2)/v1 < tol and abs(v2-v3)/v2 < tol:
             patterns.append("Triple Bottom")
     
-    # Rectangle
     s = df['close'][-lookback:]
     if ((s <= s.max() + 0.015*s.max()) & (s >= s.min() - 0.015*s.min())).all():
         patterns.append("Rectangle")
     
-    # Head and Shoulders
     highs = df['high']
     lh = highs.rolling(3).apply(lambda x: x[1] > x[0] and x[1] > x[2], raw=True).fillna(0)
     p = highs[lh > 0].tail(3)
     if len(p) == 3 and p.iloc[1] > p.iloc[0] and p.iloc[1] > p.iloc[2]:
         patterns.append("Head & Shoulders")
     
-    # Inverse Head and Shoulders
     lows = df['low']
     lh = lows.rolling(3).apply(lambda x: x[1] < x[0] and x[1] < x[2], raw=True).fillna(0)
     t = lows[lh > 0].tail(3)
     if len(t) == 3 and t.iloc[1] < t.iloc[0] and t.iloc[1] < t.iloc[2]:
         patterns.append("Inv Head & Shoulders")
     
-    # Cup and Handle
     cl = df['close'][-45:]
     mid = 45 // 2
     if cl.iloc[0] > cl.min() and cl.iloc[mid] == cl.min() and cl.iloc[-1] > cl.iloc[mid]:
         patterns.append("Cup & Handle")
     
-    # Wedges
     close_window = df['close'][-window:]
     if close_window.is_monotonic_increasing and close_window.diff().min() > 0 and close_window.diff().max() / close_window.diff().min() < 4:
         patterns.append("Rising Wedge")
     if close_window.is_monotonic_decreasing and close_window.diff().max() < 0 and abs(close_window.diff().min() / close_window.diff().max()) < 4:
         patterns.append("Falling Wedge")
     
-    # Triangles
     highs = df['high'][-30:]
     lows = df['low'][-30:]
     resist, supp = highs.max(), lows.min()
@@ -728,7 +682,6 @@ def get_chart_patterns(df: pd.DataFrame) -> List[str]:
     if any(abs(h - supp) / supp < tol for h in close[peaks]):
         patterns.append("Descending Triangle")
     
-    # Broadening
     high, low = df['high'][-lookback_long:], df['low'][-lookback_long:]
     if high.is_monotonic_increasing and low.is_monotonic_decreasing:
         patterns.append("Broadening")
@@ -737,7 +690,6 @@ def get_chart_patterns(df: pd.DataFrame) -> List[str]:
 
 # ================== SMC & STRUCTURE ANALYSIS ==================
 def detect_fvg(df: pd.DataFrame, window: int = 3) -> List[Tuple[str, int]]:
-    """Detect fair value gaps."""
     gaps = []
     for i in range(window, len(df) - window):
         hi_prev = df['high'].iloc[i-1]
@@ -749,7 +701,6 @@ def detect_fvg(df: pd.DataFrame, window: int = 3) -> List[Tuple[str, int]]:
     return gaps
 
 def find_sr_zones(df: pd.DataFrame, bins: int = 30) -> List[float]:
-    """Identify support/resistance zones."""
     prices = df['close'][-100:]
     counts, edges = pd.cut(prices, bins, retbins=True, labels=False)
     levels = []
@@ -760,7 +711,6 @@ def find_sr_zones(df: pd.DataFrame, bins: int = 30) -> List[float]:
     return sorted(set(round(l, 3) for l in levels))
 
 def detect_bos_choch(df: pd.DataFrame, lookback: int = 20) -> Optional[str]:
-    """Detect break of structure (BOS) or change of character (CHOCH)."""
     closes = df['close'][-lookback:]
     if closes.iloc[-1] > closes.iloc[:-1].max():
         return "up_bos"
@@ -770,7 +720,6 @@ def detect_bos_choch(df: pd.DataFrame, lookback: int = 20) -> Optional[str]:
 
 # ================== MARKET REGIME DETECTION ==================
 def detect_market_regime(df: pd.DataFrame) -> str:
-    """Detect market regime based on ADX, volatility, and Bollinger Bands."""
     adx_avg = df['adx'].tail(10).mean() if 'adx' in df else 0
     volatility_avg = df['volatility'].tail(10).mean() if 'volatility' in df else 0
     bb_width_avg = df['bb_width'].tail(10).mean() if 'bb_width' in df else 0
@@ -786,8 +735,8 @@ def detect_market_regime(df: pd.DataFrame) -> str:
     else:
         return "neutral"
 
+# ================== MULTI-TIMEFRAME CONFLUENCE ==================
 async def multi_timeframe_confluence(exchange: ccxt_async.Exchange, symbol: str) -> Tuple[int, Dict]:
-    """Calculate multi-timeframe confluence score in parallel."""
     confluence_score = 0
     tf_data = {}
     tasks = [fetch_and_analyze_tf(exchange, symbol, tf) for tf in CONFIG["timeframes"]]
@@ -803,7 +752,6 @@ async def multi_timeframe_confluence(exchange: ccxt_async.Exchange, symbol: str)
     return confluence_score, tf_data
 
 async def fetch_and_analyze_tf(exchange: ccxt_async.Exchange, symbol: str, timeframe: str) -> Tuple[Optional[pd.DataFrame], int]:
-    """Fetch and analyze data for a single timeframe."""
     try:
         df = await fetch_ohlcv_single(exchange, symbol, timeframe, limit=300)
         if df is None or len(df) < 200:
@@ -831,7 +779,6 @@ class OptimizedCryptoMLClassifier:
         self.last_retrained = 0
 
     def create_features(self, df: pd.DataFrame, chart_patterns: List[str], fvg: List, choch: str, sr_levels: List[float], golden_cross: str) -> Dict:
-        """Create feature vector for ML model."""
         last = df.iloc[-1]
         prev = df.iloc[-2] if len(df) > 1 else last
         features = {
@@ -865,7 +812,6 @@ class OptimizedCryptoMLClassifier:
         return features
 
     def prepare_training_data(self, historical_signals: List[Dict]) -> Tuple[np.ndarray, np.ndarray]:
-        """Prepare training data from historical signals."""
         X, y = [], []
         for signal in historical_signals:
             if 'features' in signal and 'outcome' in signal:
@@ -879,7 +825,6 @@ class OptimizedCryptoMLClassifier:
         return np.array(X), np.array(y)
 
     async def train_model(self, exchange: ccxt_async.Exchange, symbol: str, timeframe: str) -> bool:
-        """Train ML model using real OHLCV data."""
         df = await fetch_ohlcv_single(exchange, symbol, timeframe, limit=1000)
         if df is None or len(df) < 200:
             logger.warning(f"Insufficient data for ML training: {symbol}-{timeframe}")
@@ -896,7 +841,7 @@ class OptimizedCryptoMLClassifier:
             sr_levels = find_sr_zones(window)
             golden_cross = detect_golden_cross(window)
             signal = get_enhanced_signal(window, chart_patterns, fvg, choch, sr_levels,
-                                         detect_market_regime(window), 0, golden_cross,symbol)
+                                         detect_market_regime(window), 0, golden_cross, symbol)
             if signal:
                 future_price = df['close'].iloc[i+50]
                 outcome = 1 if (signal['direction'] == "LONG" and future_price > signal['entry']) or \
@@ -972,7 +917,6 @@ class OptimizedCryptoMLClassifier:
             return False
 
     def predict(self, features: Dict) -> Tuple[float, int]:
-        """Predict signal outcome using trained model."""
         if 'best' not in self.models:
             return 0.5, 0
         try:
@@ -987,7 +931,6 @@ class OptimizedCryptoMLClassifier:
             return 0.5, 0
 
     def save_model(self, filepath: str = 'optimized_crypto_ml_model.pkl') -> bool:
-        """Save ML model with encryption."""
         try:
             model_data = pickle.dumps({
                 'model': self.models.get('best'),
@@ -1006,7 +949,6 @@ class OptimizedCryptoMLClassifier:
             return False
 
     def load_model(self, filepath: str = 'optimized_crypto_ml_model.pkl') -> bool:
-        """Load ML model with decryption."""
         try:
             with open(filepath, 'rb') as f:
                 encrypted_data = f.read()
@@ -1028,7 +970,6 @@ ml_classifier = OptimizedCryptoMLClassifier()
 
 # ================== SIGNAL MANAGEMENT ==================
 def enhanced_signal_score(df: pd.DataFrame, direction: str, chart_patterns: List[str], fvg: List, choch: str, sr_levels: List[float], regime: str, confluence_score: int, golden_cross: str) -> Tuple[int, List[str]]:
-    """Calculate enhanced signal score using plugins."""
     total_score, all_patterns = 0, []
     context = {
         "chart_patterns": chart_patterns,
@@ -1046,6 +987,7 @@ def enhanced_signal_score(df: pd.DataFrame, direction: str, chart_patterns: List
                 score, patterns = SCORING_PLUGINS[plugin_name].score(df, direction, **context)
                 total_score += score
                 all_patterns.extend(patterns)
+                logger.info(f"{plugin_name} score: {score}, patterns: {patterns}")
             except Exception as e:
                 logger.error(f"Error applying scoring plugin {plugin_name}: {str(e)}")
     
@@ -1064,7 +1006,6 @@ def enhanced_signal_score(df: pd.DataFrame, direction: str, chart_patterns: List
     return int(total_score), list(set(all_patterns))
 
 def dynamic_risk_management(df: pd.DataFrame, entry: float, direction: str, regime: str) -> Tuple[float, List[float]]:
-    """Calculate dynamic stop-loss and take-profit levels."""
     atr = df.get('atr', pd.Series([1])).iloc[-1]
     if regime == "volatile":
         sl_mult = CONFIG['atr_sl_mult'] * 1.5
@@ -1080,8 +1021,8 @@ def dynamic_risk_management(df: pd.DataFrame, entry: float, direction: str, regi
     tps = [entry + tp_mult * atr * i for i in (1, 1.5, 2)] if direction == "LONG" else [entry - tp_mult * atr * i for i in (1, 1.5, 2)]
     return sl, tps
 
-def get_enhanced_signal(df: pd.DataFrame, chart_patterns: List[str], fvg: List, choch: str, sr_levels: List[float], regime: str, confluence_score: int, golden_cross: str,symbol: str) -> Optional[Dict]:
-    """Generate enhanced trading signal."""
+def get_enhanced_signal(df: pd.DataFrame, chart_patterns: List[str], fvg: List, choch: str, sr_levels: List[float], regime: str, confluence_score: int, golden_cross: str, symbol: str) -> Optional[Dict]:
+    logger.info(f"Generating signal for {symbol}: Patterns={chart_patterns}, FVG={fvg}, CHOCH={choch}, SR={sr_levels}, Regime={regime}, Confluence={confluence_score}, GoldenCross={golden_cross}")
     for direction in ("LONG", "SHORT"):
         total_score, patterns = enhanced_signal_score(df, direction, chart_patterns, fvg, choch, sr_levels, regime, confluence_score, golden_cross)
         logger.info(f"{symbol}:{direction} Score: {total_score}, Patterns: {patterns}")
@@ -1111,11 +1052,12 @@ def get_enhanced_signal(df: pd.DataFrame, chart_patterns: List[str], fvg: List, 
                 "sr": sr_levels, "atr": last.get('atr', 0), "bar_ts": str(df.index[-1]),
                 "golden_cross": golden_cross
             }
+        else:
+            logger.info(f"{symbol}:{direction} Score {total_score} below threshold {CONFIG['conf_threshold']}")
     return None
 
 # ================== LIVE DATA MONITORING ==================
 async def monitor_live_data(exchange: ccxt_async.Exchange):
-    """Monitor live prices and update open signals."""
     while True:
         try:
             for symbol in CONFIG["pairs"]:
@@ -1180,7 +1122,6 @@ async def monitor_live_data(exchange: ccxt_async.Exchange):
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(5))
 @rate_limit("telegram")
 async def send_telegram(text: str) -> bool:
-    """Send message to Telegram with retry logic and sanitization."""
     sanitized_text = sanitize_string(text)
     if not sanitized_text:
         logger.error("Invalid or empty Telegram message after sanitization")
@@ -1199,17 +1140,14 @@ async def send_telegram(text: str) -> bool:
         return False
 
 def log_signal(signal: Dict):
-    """Log signal to file."""
     with open(CONFIG['log_file'], 'a') as f:
         f.write(json.dumps(signal, default=str) + "\n")
 
 def clean_stale_signals(signals: Dict) -> Dict:
-    """Remove expired signals."""
     now = time.time()
     return {k: v for k, v in signals.items() if now - v['timestamp'] < CONFIG['signal_lifetime_sec']}
 
 def update_signal_outcome(signal_key: str, outcome: int):
-    """Update signal outcome in history."""
     for signal in signal_history:
         if signal.get('key') == signal_key:
             signal['outcome'] = outcome
@@ -1217,7 +1155,6 @@ def update_signal_outcome(signal_key: str, outcome: int):
 
 # ================== MAIN MONITORING LOOP ==================
 async def monitor():
-    """Main monitoring loop for signal generation."""
     global open_signals, signal_history
     validate_config()
     exchange = ccxt_async.binance(CONFIG["exchanges"]["binance"])
@@ -1228,6 +1165,7 @@ async def monitor():
 
     valid_pairs = await validate_symbols(exchange)
     CONFIG["pairs"] = valid_pairs
+    logger.info(f"Valid pairs: {valid_pairs}")
     if not valid_pairs:
         logger.error("No valid symbols to monitor. Exiting...")
         sys.exit(1)
@@ -1239,6 +1177,7 @@ async def monitor():
                 ml_classifier.save_model()
             else:
                 logger.warning("Model training failed. Running without ML.")
+                CONFIG["ml_enabled"] = False
 
     asyncio.create_task(monitor_live_data(exchange))
     cycle_count = 0
@@ -1255,8 +1194,7 @@ async def monitor():
                 logger.info("Periodic model retraining...")
                 outcomes = [s for s in signal_history if 'outcome' in s]
                 if len(outcomes) >= 100:
-                    X, y = ml_classifier.prepare_training_data(outcomes)
-                    if ml_classifier.train_model(X, y):
+                    if await ml_classifier.train_model(exchange, valid_pairs[0], CONFIG["timeframes"][0]):
                         ml_classifier.save_model()
 
         for symbol_batch in [CONFIG["pairs"][i:i+10] for i in range(0, len(CONFIG["pairs"]), 10)]:
@@ -1265,7 +1203,7 @@ async def monitor():
                     ohlcv_batch = await fetch_ohlcv_batch(exchange, symbol_batch, tf)
                     for symbol, df in ohlcv_batch.items():
                         if df is None or len(df) < 200:
-                            logger.info(f"Data fetch failed or insufficient for {symbol}-{tf}")
+                            logger.info(f"Data fetch failed or insufficient for {symbol}-{tf}: {len(df) if df is not None else 'None'} rows")
                             continue
                         df = apply_indicators(df)
                         regime = detect_market_regime(df)
@@ -1316,7 +1254,6 @@ async def monitor():
         await asyncio.sleep(CONFIG['scan_interval'])
 
 async def list_perpetual_futures_pairs(exchange: ccxt_async.Exchange) -> List[str]:
-    """List available perpetual futures pairs."""
     try:
         await exchange.load_markets(reload=True)
         markets = exchange.markets
