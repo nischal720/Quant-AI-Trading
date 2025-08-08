@@ -53,7 +53,7 @@ CONFIG = {
         }
     },
     "pairs": ["BNB/USDT:USDT", "XRP/USDT:USDT", "SOL/USDT:USDT", "TON/USDT:USDT"],
-    "timeframes": ["1h","2h" "4h", "1d"],
+    "timeframes": ["1h","2h", "4h", "1d"],
     "conf_threshold": 50,  # Lowered for testing
     "atr_sl_mult": 1.8,
     "atr_tp_mult": 2.5,
@@ -155,7 +155,7 @@ def validate_config():
     if not all(isinstance(p, str) and p.endswith('USDT') for p in CONFIG["pairs"]):
         logger.error("Invalid trading pairs format")
         sys.exit(1)
-    if not all(tf in ["1m", "5m", "15m", "1h", "4h", "1d"] for tf in CONFIG["timeframes"]):
+    if not all(tf in ["1m", "5m", "15m", "1h","2h", "4h", "12h", "1d"] for tf in CONFIG["timeframes"]):
         logger.error("Invalid timeframes")
         sys.exit(1)
     logger.info("Configuration validated successfully")
