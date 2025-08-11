@@ -54,7 +54,7 @@ CONFIG = {
     },
     "pairs": ["BNB/USDT:USDT", "XRP/USDT:USDT", "SOL/USDT:USDT", "TON/USDT:USDT"],
     "timeframes": ["1h","2h", "4h", "1d"],
-    "conf_threshold": 50,  # Lowered for testing
+    "conf_threshold": 80,  # Lowered for testing
     "atr_sl_mult": 1.8,
     "atr_tp_mult": 2.5,
     "adx_threshold": 25,
