@@ -77,7 +77,7 @@ CONFIG = {
     "scoring_plugins": ["ema_alignment", "golden_cross", "rsi", "macd", "stoch", "adx", "volume", "bbands", "order_flow", "chart_patterns", "smc", "vwap", "trendline_breakout"],
     "min_volume_multiple": 0.5,  # For data quality: min volume relative to MA
     "min_body_ratio": 0.3,  # For bar quality: body / range >= this
-    "tf_weights": {"1h": 1.0, "2h": 1.2, "4h": 1.5, "1d": 2.0},  # Weighted TF confluence
+    "tf_weights": {"15m": 0.5,  "1h": 1.0, "2h": 1.2, "4h": 1.5, "1d": 2.0},  # Weighted TF confluence
     "economic_calendar_url": "https://nfs.faireconomy.media/ff_calendar_thisweek.json",  # Free Forex Factory calendar
     "event_impact_threshold": "high",  # Filter signals near high-impact events
     "event_window_hours": 1,  # Avoid signals within 1 hour before/after events
