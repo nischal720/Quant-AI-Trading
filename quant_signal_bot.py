@@ -6,7 +6,7 @@ import talib
 import numpy as np
 from telegram import Bot
 from flask import Flask, request
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.preprocessing import StandardScaler
@@ -54,7 +54,7 @@ CONFIG = {
     },
     "pairs": ["BNB/USDT:USDT", "XRP/USDT:USDT", "SOL/USDT:USDT", "TON/USDT:USDT"],
     "timeframes": ["1h","2h", "4h", "1d"],
-    "conf_threshold": 50,  # Lowered for testing
+    "conf_threshold": 80,  # Lowered for testing
     "atr_sl_mult": 1.8,
     "atr_tp_mult": 2.5,
     "adx_threshold": 25,
@@ -73,8 +73,15 @@ CONFIG = {
     "encryption_key": os.environ.get("ENCRYPTION_KEY", Fernet.generate_key().decode()),
     "flask_rate_limit": {"requests": 100, "window": 60},
     "telegram_rate_limit": {"requests": 20, "window": 60},
-    "indicator_plugins": ["ema", "rsi", "macd", "bbands", "stoch", "willr", "adx", "atr", "volatility", "obv", "cmf", "mfi", "candle_patterns", "order_flow", "vwap"],
-    "scoring_plugins": ["ema_alignment", "golden_cross", "rsi", "macd", "stoch", "adx", "volume", "bbands", "order_flow", "chart_patterns", "smc", "vwap"]
+    "indicator_plugins": ["ema", "rsi", "macd", "bbands", "stoch", "willr", "adx", "atr", "volatility", "obv", "cmf", "mfi", "candle_patterns", "order_flow", "vwap", "trendline"],
+    "scoring_plugins": ["ema_alignment", "golden_cross", "rsi", "macd", "stoch", "adx", "volume", "bbands", "order_flow", "chart_patterns", "smc", "vwap", "trendline_breakout"],
+    "min_volume_multiple": 0.5,  # For data quality: min volume relative to MA
+    "min_body_ratio": 0.3,  # For bar quality: body / range >= this
+    "tf_weights": {"1h": 1.0, "2h": 1.2, "4h": 1.5, "1d": 2.0},  # Weighted TF confluence
+    "economic_calendar_url": "https://nfs.faireconomy.media/ff_calendar_thisweek.json",  # Free Forex Factory calendar
+    "event_impact_threshold": "high",  # Filter signals near high-impact events
+    "event_window_hours": 1,  # Avoid signals within 1 hour before/after events
+    "event_currencies": ["USD"]  # Filter economic events by these currencies
 }
 
 # Global state
@@ -86,6 +93,8 @@ live_data_cache = {}
 ohlcv_cache = {}
 invalid_symbols = set()
 fernet = Fernet(CONFIG["encryption_key"].encode())
+economic_events = []  # Cache for economic events
+economic_events_last_fetch = 0
 
 # Rate limiting storage
 flask_rate_limits = defaultdict(lambda: {"count": 0, "reset_time": 0})
@@ -290,6 +299,48 @@ class VWAPPlugin(IndicatorPlugin):
         df['vwap'] = (typical_price * df['volume']).cumsum() / df['volume'].cumsum()
         return df
 
+class TrendLinePlugin(IndicatorPlugin):
+    def compute(self, df: pd.DataFrame) -> pd.DataFrame:
+        # Find pivot highs and lows
+        df['pivot_low'] = (df['low'].shift(1) > df['low']) & (df['low'].shift(-1) > df['low'])
+        df['pivot_high'] = (df['high'].shift(1) < df['high']) & (df['high'].shift(-1) < df['high'])
+
+        n = len(df)
+        x = np.arange(n)
+
+        # Uptrend line (support): fit on pivot lows
+        pivot_low_indices = np.where(df['pivot_low'])[0]
+        if len(pivot_low_indices) >= 2:
+            coef = np.polyfit(pivot_low_indices, df['low'].iloc[pivot_low_indices], 1)
+            df['up_trend_line'] = coef[0] * x + coef[1]
+        else:
+            df['up_trend_line'] = np.nan
+
+        # Downtrend line (resistance): fit on pivot highs
+        pivot_high_indices = np.where(df['pivot_high'])[0]
+        if len(pivot_high_indices) >= 2:
+            coef = np.polyfit(pivot_high_indices, df['high'].iloc[pivot_high_indices], 1)
+            df['down_trend_line'] = coef[0] * x + coef[1]
+        else:
+            df['down_trend_line'] = np.nan
+
+        # Breakout
+        df['up_breakout'] = (df['close'] > df['down_trend_line']) & (df['close'].shift(1) <= df['down_trend_line'].shift(1))
+        df['down_breakout'] = (df['close'] < df['up_trend_line']) & (df['close'].shift(1) >= df['up_trend_line'].shift(1))
+
+        # False breakout: breakout but reverses in next 3 bars
+        df['false_up_breakout'] = False
+        df['false_down_breakout'] = False
+        for i in range(len(df) - 3):
+            if df['up_breakout'].iloc[i]:
+                if df['close'].iloc[i+3] < df['down_trend_line'].iloc[i+3]:
+                    df.loc[df.index[i], 'false_up_breakout'] = True
+            if df['down_breakout'].iloc[i]:
+                if df['close'].iloc[i+3] > df['up_trend_line'].iloc[i+3]:
+                    df.loc[df.index[i], 'false_down_breakout'] = True
+
+        return df
+
 class CustomIndicatorPlugin(IndicatorPlugin):
     def __init__(self, name: str, compute_fn: Callable[[pd.DataFrame], pd.DataFrame]):
         super().__init__(name)
@@ -359,7 +410,8 @@ class ADXPluginScoring(ScoringPlugin):
     def score(self, df: pd.DataFrame, direction: str, **context) -> Tuple[int, List[str]]:
         last = df.iloc[-1]
         score, patterns = 0, []
-        if last['adx'] > CONFIG['adx_threshold']:
+        threshold = context.get("adx_threshold", CONFIG['adx_threshold'])
+        if last['adx'] > threshold:
             score += 12
             patterns.append("ADX Strong Trend")
         return score, patterns
@@ -410,6 +462,30 @@ class ChartPatternsPluginScoring(ScoringPlugin):
             if "Inv Head & Shoulders" in chart_patterns:
                 score += 20
                 patterns.append("Inv H&S")
+            if "Triple Bottom" in chart_patterns:
+                score += 16
+                patterns.append("Triple Bottom")
+            if "Ascending Triangle" in chart_patterns:
+                score += 15
+                patterns.append("Ascending Triangle")
+            if "Falling Wedge" in chart_patterns:
+                score += 15
+                patterns.append("Falling Wedge")
+            if "Cup & Handle" in chart_patterns:
+                score += 18
+                patterns.append("Cup & Handle")
+            if "Pipe Bottom" in chart_patterns:
+                score += 16
+                patterns.append("Pipe Bottom")
+            if "Gap Up" in chart_patterns:
+                score += 10
+                patterns.append("Gap Up")
+            if "Narrow Range" in chart_patterns:
+                score += 12
+                patterns.append("Narrow Range")
+            if "Flag" in chart_patterns or "Pennant" in chart_patterns:
+                score += 14  # Continuation in up trend
+                patterns.append("Flag/Pennant")
         elif direction == "SHORT":
             if "Double Top" in chart_patterns:
                 score += 16
@@ -417,6 +493,21 @@ class ChartPatternsPluginScoring(ScoringPlugin):
             if "Head & Shoulders" in chart_patterns:
                 score += 20
                 patterns.append("H&S")
+            if "Triple Top" in chart_patterns:
+                score += 16
+                patterns.append("Triple Top")
+            if "Descending Triangle" in chart_patterns:
+                score += 15
+                patterns.append("Descending Triangle")
+            if "Rising Wedge" in chart_patterns:
+                score += 15
+                patterns.append("Rising Wedge")
+            if "Gap Down" in chart_patterns:
+                score += 10
+                patterns.append("Gap Down")
+            if "Flag" in chart_patterns or "Pennant" in chart_patterns:
+                score += 14  # Continuation in down trend
+                patterns.append("Flag/Pennant")
         return score, patterns
 
 class SMCPluginScoring(ScoringPlugin):
@@ -454,6 +545,26 @@ class VWAPPluginScoring(ScoringPlugin):
             patterns.append("Below VWAP")
         return score, patterns
 
+class TrendLineBreakoutPlugin(ScoringPlugin):
+    def score(self, df: pd.DataFrame, direction: str, **context) -> Tuple[int, List[str]]:
+        last = df.iloc[-1]
+        score, patterns = 0, []
+        if direction == "LONG" and last.get('up_breakout', False):
+            score += 15
+            patterns.append("Uptrend Breakout")
+        elif direction == "SHORT" and last.get('down_breakout', False):
+            score += 15
+            patterns.append("Downtrend Breakout")
+        # Check recent false breakouts
+        prev = df.iloc[-10:-1]
+        if direction == "LONG" and any(prev.get('false_up_breakout', False)):
+            score -= 10
+            patterns.append("Recent False Up Breakout")
+        elif direction == "SHORT" and any(prev.get('false_down_breakout', False)):
+            score -= 10
+            patterns.append("Recent False Down Breakout")
+        return score, patterns
+
 # Plugin Registry
 INDICATOR_PLUGINS = {
     "ema": EMAPlugin("ema"),
@@ -470,7 +581,8 @@ INDICATOR_PLUGINS = {
     "mfi": MFIPlugin("mfi"),
     "candle_patterns": CandlePatternsPlugin("candle_patterns"),
     "order_flow": OrderFlowPlugin("order_flow"),
-    "vwap": VWAPPlugin("vwap")
+    "vwap": VWAPPlugin("vwap"),
+    "trendline": TrendLinePlugin("trendline")
 }
 
 SCORING_PLUGINS = {
@@ -485,7 +597,8 @@ SCORING_PLUGINS = {
     "order_flow": OrderFlowPluginScoring("order_flow"),
     "chart_patterns": ChartPatternsPluginScoring("chart_patterns"),
     "smc": SMCPluginScoring("smc"),
-    "vwap": VWAPPluginScoring("vwap")
+    "vwap": VWAPPluginScoring("vwap"),
+    "trendline_breakout": TrendLineBreakoutPlugin("trendline_breakout")
 }
 
 # ================== DATA FETCHING ==================
@@ -584,6 +697,44 @@ async def fetch_live_price(exchange: ccxt_async.Exchange, symbol: str) -> Option
         logger.error(f"Live price fetch error for {symbol}: {str(e)}")
         return None
 
+# ================== ECONOMIC CALENDAR INTEGRATION ==================
+async def fetch_economic_calendar() -> List[Dict]:
+    global economic_events, economic_events_last_fetch
+    if time.time() - economic_events_last_fetch < 3600:
+        logger.info(f"Using cached economic events ({len(economic_events)} events)")
+        return economic_events
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(CONFIG["economic_calendar_url"], timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    economic_events = [
+                        event for event in data
+                        if event.get('impact', '').lower() == CONFIG["event_impact_threshold"]
+                        and event.get('currency', '') in CONFIG.get("event_currencies", ["USD"])
+                    ]
+                    economic_events_last_fetch = time.time()
+                    logger.info(f"Fetched {len(economic_events)} high-impact events: {[event['date'] for event in economic_events[:5]]}")
+                    return economic_events
+                else:
+                    logger.error(f"Failed to fetch economic calendar: HTTP {response.status}")
+                    return []
+    except Exception as e:
+        logger.error(f"Error fetching economic calendar: {str(e)}")
+        return []
+
+def is_near_event(current_time: datetime) -> bool:
+    for event in economic_events:
+        try:
+            event_time = datetime.strptime(event['date'], '%Y-%m-%dT%H:%M:%S%z')
+            time_diff_hours = abs((current_time - event_time.replace(tzinfo=timezone.utc)).total_seconds()) / 3600
+            if time_diff_hours <= CONFIG["event_window_hours"]:
+                logger.info(f"Near event detected: {event['title']} at {event['date']} (Impact: {event['impact']}, Diff: {time_diff_hours:.2f} hours)")
+                return True
+        except ValueError as e:
+            logger.error(f"Failed to parse event date '{event.get('date', 'N/A')}': {str(e)}")
+    return False
+
 # ================== INDICATOR AND SCORING MANAGEMENT ==================
 def apply_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -599,6 +750,9 @@ def apply_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['range_pct'] = (df['high'] - df['low']) / df['close']
     df['roc'] = pta.roc(df['close'], length=10)
     df['cci'] = pta.cci(df['high'], df['low'], df['close'])
+    # Add bar quality
+    vol_ma = df['volume'].rolling(20).mean()
+    df['is_quality_bar'] = (df['volume'] >= CONFIG["min_volume_multiple"] * vol_ma) & (df['body_size'] >= CONFIG["min_body_ratio"] * df['range_pct'])
     key_columns = ['ema20', 'ema50', 'ema200', 'rsi', 'macd', 'stoch_k', 'adx', 'volume', 'bb_position', 'buying_pressure']
     for col in key_columns:
         if col in df and df[col].isnull().all():
@@ -626,15 +780,14 @@ def get_chart_patterns(df: pd.DataFrame) -> List[str]:
     close = df['close']
     peaks = (close.shift(1) < close) & (close.shift(-1) < close)
     valleys = (close.shift(1) > close) & (close.shift(-1) > close)
-    peak_idxs = close[peaks].index[-2:]
-    valley_idxs = close[valleys].index[-2:]
-    if len(peak_idxs) == 2 and abs(close.loc[peak_idxs[0]] - close.loc[peak_idxs[1]]) / close.loc[peak_idxs[0]] < tol:
+    peak_idxs = close[peaks].index[-3:]  
+    valley_idxs = close[valleys].index[-3:]
+    
+    if len(peak_idxs) >= 2 and abs(close.loc[peak_idxs[-2]] - close.loc[peak_idxs[-1]]) / close.loc[peak_idxs[-2]] < tol:
         patterns.append("Double Top")
-    if len(valley_idxs) == 2 and abs(close.loc[valley_idxs[0]] - close.loc[valley_idxs[1]]) / close.loc[valley_idxs[0]] < tol:
+    if len(valley_idxs) >= 2 and abs(close.loc[valley_idxs[-2]] - close.loc[valley_idxs[-1]]) / close.loc[valley_idxs[-2]] < tol:
         patterns.append("Double Bottom")
     
-    peak_idxs = close[peaks].index[-3:]
-    valley_idxs = close[valleys].index[-3:]
     if len(peak_idxs) == 3:
         v1, v2, v3 = close.loc[peak_idxs]
         if abs(v1-v2)/v1 < tol and abs(v2-v3)/v2 < tol:
@@ -649,13 +802,13 @@ def get_chart_patterns(df: pd.DataFrame) -> List[str]:
         patterns.append("Rectangle")
     
     highs = df['high']
-    lh = highs.rolling(3).apply(lambda x: x[1] > x[0] and x[1] > x[2], raw=True).fillna(0)
+    lh = highs.rolling(3, center=True).apply(lambda x: x[1] > x[0] and x[1] > x[2], raw=True).fillna(0)
     p = highs[lh > 0].tail(3)
     if len(p) == 3 and p.iloc[1] > p.iloc[0] and p.iloc[1] > p.iloc[2]:
         patterns.append("Head & Shoulders")
     
     lows = df['low']
-    lh = lows.rolling(3).apply(lambda x: x[1] < x[0] and x[1] < x[2], raw=True).fillna(0)
+    lh = lows.rolling(3, center=True).apply(lambda x: x[1] < x[0] and x[1] < x[2], raw=True).fillna(0)
     t = lows[lh > 0].tail(3)
     if len(t) == 3 and t.iloc[1] < t.iloc[0] and t.iloc[1] < t.iloc[2]:
         patterns.append("Inv Head & Shoulders")
@@ -666,9 +819,9 @@ def get_chart_patterns(df: pd.DataFrame) -> List[str]:
         patterns.append("Cup & Handle")
     
     close_window = df['close'][-window:]
-    if close_window.is_monotonic_increasing and close_window.diff().min() > 0 and close_window.diff().max() / close_window.diff().min() < 4:
+    if all(close_window.diff()[1:] > 0) and close_window.diff().max() / close_window.diff().min() < 4:
         patterns.append("Rising Wedge")
-    if close_window.is_monotonic_decreasing and close_window.diff().max() < 0 and abs(close_window.diff().min() / close_window.diff().max()) < 4:
+    if all(close_window.diff()[1:] < 0) and abs(close_window.diff().min() / close_window.diff().max()) < 4:
         patterns.append("Falling Wedge")
     
     highs = df['high'][-30:]
@@ -683,8 +836,40 @@ def get_chart_patterns(df: pd.DataFrame) -> List[str]:
         patterns.append("Descending Triangle")
     
     high, low = df['high'][-lookback_long:], df['low'][-lookback_long:]
-    if high.is_monotonic_increasing and low.is_monotonic_decreasing:
+    if all(high.diff()[1:] > 0) and all(low.diff()[1:] < 0):
         patterns.append("Broadening")
+    
+    # Flag and Pennant
+    if len(df) > 10:
+        recent_highs = df['high'][-5:]
+        recent_lows = df['low'][-5:]
+        x = np.arange(len(recent_highs))
+        slope_high = np.corrcoef(x, recent_highs)[0,1] * recent_highs.std() / x.std()
+        slope_low = np.corrcoef(x, recent_lows)[0,1] * recent_lows.std() / x.std()
+        if abs(slope_high - slope_low) < 0.01 and abs(slope_high) > 0:  # Parallel
+            patterns.append("Flag")
+        if abs(slope_high) > 0 and abs(slope_low) > 0 and slope_high * slope_low < 0:  # Converging
+            patterns.append("Pennant")
+    
+    # Gaps
+    if len(df) > 1:
+        if df['open'].iloc[-1] > df['high'].iloc[-2]:
+            patterns.append("Gap Up")
+        if df['open'].iloc[-1] < df['low'].iloc[-2]:
+            patterns.append("Gap Down")
+    
+    # Pipe Bottom
+    if len(df) > 2:
+        ranges = df['high'] - df['low']
+        if ranges.iloc[-2] > ranges.iloc[:-2].max() and ranges.iloc[-1] > ranges.iloc[:-2].max():
+            if df['close'].iloc[-2] < df['open'].iloc[-2] and df['close'].iloc[-1] > (df['high'].iloc[-1] + df['low'].iloc[-1]) / 2:
+                patterns.append("Pipe Bottom")
+    
+    # Narrow Range
+    if len(df) > 4:
+        ranges = df['high'] - df['low']
+        if ranges.iloc[-1] < min(ranges.iloc[-4:-1]):
+            patterns.append("Narrow Range")
     
     return patterns
 
@@ -748,8 +933,9 @@ async def multi_timeframe_confluence(exchange: ccxt_async.Exchange, symbol: str)
             continue
         if result:
             tf_data[tf], score = result
-            confluence_score += score
-    return confluence_score, tf_data
+            weight = CONFIG["tf_weights"].get(tf, 1.0)
+            confluence_score += score * weight
+    return int(confluence_score), tf_data
 
 async def fetch_and_analyze_tf(exchange: ccxt_async.Exchange, symbol: str, timeframe: str) -> Tuple[Optional[pd.DataFrame], int]:
     try:
@@ -778,9 +964,11 @@ class OptimizedCryptoMLClassifier:
         self.performance_history = {}
         self.last_retrained = 0
 
-    def create_features(self, df: pd.DataFrame, chart_patterns: List[str], fvg: List, choch: str, sr_levels: List[float], golden_cross: str) -> Dict:
+    def create_features(self, df: pd.DataFrame, chart_patterns: List[str], fvg: List, choch: str, sr_levels: List[float], golden_cross: str, regime: str) -> Dict:
         last = df.iloc[-1]
         prev = df.iloc[-2] if len(df) > 1 else last
+        recent_false_up = 1 if df['false_up_breakout'].tail(5).any() else 0
+        recent_false_down = 1 if df['false_down_breakout'].tail(5).any() else 0
         features = {
             'ema_alignment': 1 if last.get('ema20', 0) > last.get('ema50', 0) > last.get('ema200', 0) else 
                            -1 if last.get('ema20', 0) < last.get('ema50', 0) < last.get('ema200', 0) else 0,
@@ -807,7 +995,31 @@ class OptimizedCryptoMLClassifier:
             'bos_down': 1 if choch == "down_bos" else 0,
             'near_support': 1 if any(abs(last['close']-lvl)/last['close']<0.01 for lvl in sr_levels if lvl < last['close']) else 0,
             'near_resistance': 1 if any(abs(last['close']-lvl)/last['close']<0.01 for lvl in sr_levels if lvl > last['close']) else 0,
-            'vwap_signal': 1 if last.get('vwap') and last['close'] > last['vwap'] else -1 if last.get('vwap') and last['close'] < last['vwap'] else 0
+            'vwap_signal': 1 if last.get('vwap') and last['close'] > last['vwap'] else -1 if last.get('vwap') and last['close'] < last['vwap'] else 0,
+            # Composite features
+            'rsi_macd_bull': 1 if last['rsi'] < 30 and last['macd_hist'] > 0 else 0,
+            'rsi_macd_bear': 1 if last['rsi'] > 70 and last['macd_hist'] < 0 else 0,
+            'stoch_rsi_bull': 1 if last['stoch_k'] < 20 and last['rsi'] < 30 else 0,
+            'stoch_rsi_bear': 1 if last['stoch_k'] > 80 and last['rsi'] > 70 else 0,
+            # Regime features (one-hot)
+            'regime_trending': 1 if regime == "trending" else 0,
+            'regime_ranging': 1 if regime == "ranging" else 0,
+            'regime_volatile': 1 if regime == "volatile" else 0,
+            'regime_neutral': 1 if regime == "neutral" else 0,
+            # New features from PDF patterns
+            'pipe_bottom': 1 if "Pipe Bottom" in chart_patterns else 0,
+            'gap_up': 1 if "Gap Up" in chart_patterns else 0,
+            'gap_down': 1 if "Gap Down" in chart_patterns else 0,
+            'narrow_range': 1 if "Narrow Range" in chart_patterns else 0,
+            'flag': 1 if "Flag" in chart_patterns else 0,
+            'pennant': 1 if "Pennant" in chart_patterns else 0,
+            'triple_top': 1 if "Triple Top" in chart_patterns else 0,
+            'triple_bottom': 1 if "Triple Bottom" in chart_patterns else 0,
+            # Trendline features
+            'up_breakout': 1 if last.get('up_breakout', False) else 0,
+            'down_breakout': 1 if last.get('down_breakout', False) else 0,
+            'recent_false_up': recent_false_up,
+            'recent_false_down': recent_false_down,
         }
         return features
 
@@ -825,32 +1037,38 @@ class OptimizedCryptoMLClassifier:
         return np.array(X), np.array(y)
 
     async def train_model(self, exchange: ccxt_async.Exchange, symbol: str, timeframe: str) -> bool:
-        df = await fetch_ohlcv_single(exchange, symbol, timeframe, limit=1000)
+        df = await fetch_ohlcv_single(exchange, symbol, timeframe, limit=1500)
         if df is None or len(df) < 200:
-            logger.warning(f"Insufficient data for ML training: {symbol}-{timeframe}")
+            logger.warning(f"Insufficient data for ML training: {symbol}-{timeframe} ({len(df) if df is not None else 0} rows)")
             return False
 
         df = apply_indicators(df)
         historical_signals = []
 
-        for i in range(100, len(df) - 50):
-            window = df.iloc[i-100:i]
-            chart_patterns = get_chart_patterns(window)
-            fvg = detect_fvg(window)
-            choch = detect_bos_choch(window)
-            sr_levels = find_sr_zones(window)
-            golden_cross = detect_golden_cross(window)
-            signal = get_enhanced_signal(window, chart_patterns, fvg, choch, sr_levels,
-                                         detect_market_regime(window), 0, golden_cross, symbol)
-            if signal:
-                future_price = df['close'].iloc[i+50]
-                outcome = 1 if (signal['direction'] == "LONG" and future_price > signal['entry']) or \
-                              (signal['direction'] == "SHORT" and future_price < signal['entry']) else 0
-                historical_signals.append({
-                    'features': self.create_features(window, chart_patterns, fvg, choch, sr_levels, golden_cross),
-                    'outcome': outcome,
-                    'timestamp': time.time()
-                })
+        original_threshold = CONFIG['conf_threshold']
+        CONFIG['conf_threshold'] = 50  # Lower threshold for generating training data
+        try:
+            for i in range(100, len(df) - 50):
+                window = df.iloc[i-100:i]
+                regime = detect_market_regime(window)
+                chart_patterns = get_chart_patterns(window)
+                fvg = detect_fvg(window)
+                choch = detect_bos_choch(window)
+                sr_levels = find_sr_zones(window)
+                golden_cross = detect_golden_cross(window)
+                signal = get_enhanced_signal(window, chart_patterns, fvg, choch, sr_levels,
+                                             regime, 0, golden_cross, symbol)
+                if signal:
+                    future_price = df['close'].iloc[i+50]
+                    outcome = 1 if (signal['direction'] == "LONG" and future_price > signal['entry']) or \
+                                  (signal['direction'] == "SHORT" and future_price < signal['entry']) else 0
+                    historical_signals.append({
+                        'features': self.create_features(window, chart_patterns, fvg, choch, sr_levels, golden_cross, regime),
+                        'outcome': outcome,
+                        'timestamp': time.time()
+                    })
+        finally:
+            CONFIG['conf_threshold'] = original_threshold
 
         if len(historical_signals) < 100:
             logger.warning(f"Not enough training signals: {len(historical_signals)}")
@@ -932,6 +1150,7 @@ class OptimizedCryptoMLClassifier:
 
     def save_model(self, filepath: str = 'optimized_crypto_ml_model.pkl') -> bool:
         try:
+            os.makedirs(os.path.dirname(filepath) or '.', exist_ok=True)  # Create directory if it doesn't exist
             model_data = pickle.dumps({
                 'model': self.models.get('best'),
                 'scaler': self.scalers.get('best'),
@@ -968,9 +1187,39 @@ class OptimizedCryptoMLClassifier:
 
 ml_classifier = OptimizedCryptoMLClassifier()
 
+async def ensure_ml_model(exchange: ccxt_async.Exchange, valid_pairs: List[str], timeframes: List[str]) -> bool:
+    if ml_classifier.load_model():
+        logger.info("Existing ML model loaded successfully")
+        return True
+
+    logger.info("No pre-trained model found. Attempting to train new model...")
+    for symbol in valid_pairs:
+        for timeframe in timeframes:
+            logger.info(f"Training ML model with {symbol} on {timeframe}")
+            try:
+                if await ml_classifier.train_model(exchange, symbol, timeframe):
+                    ml_classifier.save_model()
+                    logger.info(f"Model trained and saved successfully for {symbol}-{timeframe}")
+                    return True
+                else:
+                    logger.warning(f"Model training failed for {symbol}-{timeframe}")
+            except Exception as e:
+                logger.error(f"Error training model for {symbol}-{timeframe}: {str(e)}")
+    logger.error("Failed to train model with any symbol-timeframe combination. Disabling ML.")
+    CONFIG["ml_enabled"] = False
+    return False
+
 # ================== SIGNAL MANAGEMENT ==================
 def enhanced_signal_score(df: pd.DataFrame, direction: str, chart_patterns: List[str], fvg: List, choch: str, sr_levels: List[float], regime: str, confluence_score: int, golden_cross: str) -> Tuple[int, List[str]]:
     total_score, all_patterns = 0, []
+    adx_threshold = CONFIG['adx_threshold']
+    if regime == "trending":
+        adx_threshold -= 5  # Lower threshold in trending markets
+    elif regime == "ranging":
+        adx_threshold += 5  # Higher in ranging
+    elif regime == "volatile":
+        adx_threshold += 3  # Adjust for volatility
+    
     context = {
         "chart_patterns": chart_patterns,
         "fvg": fvg,
@@ -978,7 +1227,8 @@ def enhanced_signal_score(df: pd.DataFrame, direction: str, chart_patterns: List
         "sr_levels": sr_levels,
         "regime": regime,
         "confluence_score": confluence_score,
-        "golden_cross": golden_cross
+        "golden_cross": golden_cross,
+        "adx_threshold": adx_threshold
     }
     
     for plugin_name in CONFIG["scoring_plugins"]:
@@ -1022,6 +1272,10 @@ def dynamic_risk_management(df: pd.DataFrame, entry: float, direction: str, regi
     return sl, tps
 
 def get_enhanced_signal(df: pd.DataFrame, chart_patterns: List[str], fvg: List, choch: str, sr_levels: List[float], regime: str, confluence_score: int, golden_cross: str, symbol: str) -> Optional[Dict]:
+    if not df['is_quality_bar'].iloc[-1]:
+        logger.info(f"{symbol}: Skipping signal generation due to low-quality bar")
+        return None
+    
     logger.info(f"Generating signal for {symbol}: Patterns={chart_patterns}, FVG={fvg}, CHOCH={choch}, SR={sr_levels}, Regime={regime}, Confluence={confluence_score}, GoldenCross={golden_cross}")
     for direction in ("LONG", "SHORT"):
         total_score, patterns = enhanced_signal_score(df, direction, chart_patterns, fvg, choch, sr_levels, regime, confluence_score, golden_cross)
@@ -1030,7 +1284,7 @@ def get_enhanced_signal(df: pd.DataFrame, chart_patterns: List[str], fvg: List, 
             last = df.iloc[-1]
             entry = last['close']
             if CONFIG['ml_enabled']:
-                features = ml_classifier.create_features(df, chart_patterns, fvg, choch, sr_levels, golden_cross)
+                features = ml_classifier.create_features(df, chart_patterns, fvg, choch, sr_levels, golden_cross, regime)
                 ml_confidence, ml_prediction = ml_classifier.predict(features)
                 logger.info(f"{direction} signal - ML Confidence: {ml_confidence:.3f}")
                 if ml_confidence < CONFIG['ml_threshold']:
@@ -1042,6 +1296,14 @@ def get_enhanced_signal(df: pd.DataFrame, chart_patterns: List[str], fvg: List, 
                 final_score = total_score
             sl, tps = dynamic_risk_management(df, entry, direction, regime)
             rr = round(abs(tps[0]-entry)/abs(entry-sl), 2) if abs(entry-sl) > 0 else 0
+            # Pattern-based target
+            pattern_target = None
+            if chart_patterns:
+                height = df['close'].max() - df['close'].min()
+                if direction == "LONG":
+                    pattern_target = entry + height
+                else:
+                    pattern_target = entry - height
             return {
                 "direction": direction, "entry": entry, "sl": sl, "tps": tps,
                 "score": int(final_score), "ml_confidence": ml_confidence,
@@ -1050,7 +1312,7 @@ def get_enhanced_signal(df: pd.DataFrame, chart_patterns: List[str], fvg: List, 
                 "regime": regime, "confluence": confluence_score,
                 "fvg": str(fvg[-1]) if fvg else "None", "choch": choch,
                 "sr": sr_levels, "atr": last.get('atr', 0), "bar_ts": str(df.index[-1]),
-                "golden_cross": golden_cross
+                "golden_cross": golden_cross, "pattern_target": pattern_target
             }
         else:
             logger.info(f"{symbol}:{direction} Score {total_score} below threshold {CONFIG['conf_threshold']}")
@@ -1155,7 +1417,7 @@ def update_signal_outcome(signal_key: str, outcome: int):
 
 # ================== MAIN MONITORING LOOP ==================
 async def monitor():
-    global open_signals, signal_history
+    global open_signals, signal_history, economic_events
     validate_config()
     exchange = ccxt_async.binance(CONFIG["exchanges"]["binance"])
     
@@ -1171,13 +1433,9 @@ async def monitor():
         sys.exit(1)
 
     if CONFIG['ml_enabled']:
-        if not ml_classifier.load_model():
-            logger.info("No pre-trained model found. Training new model...")
-            if await ml_classifier.train_model(exchange, valid_pairs[0], CONFIG["timeframes"][0]):
-                ml_classifier.save_model()
-            else:
-                logger.warning("Model training failed. Running without ML.")
-                CONFIG["ml_enabled"] = False
+        await ensure_ml_model(exchange, valid_pairs, CONFIG["timeframes"])
+
+    economic_events = await fetch_economic_calendar()
 
     asyncio.create_task(monitor_live_data(exchange))
     cycle_count = 0
@@ -1196,6 +1454,15 @@ async def monitor():
                 if len(outcomes) >= 100:
                     if await ml_classifier.train_model(exchange, valid_pairs[0], CONFIG["timeframes"][0]):
                         ml_classifier.save_model()
+
+        if cycle_count % 6 == 0:
+            economic_events = await fetch_economic_calendar()
+
+        current_dt = datetime.now(timezone.utc)
+        if economic_events and is_near_event(current_dt):
+            logger.info("Skipping signal generation due to nearby high-impact economic event")
+            await asyncio.sleep(CONFIG['scan_interval'])
+            continue
 
         for symbol_batch in [CONFIG["pairs"][i:i+10] for i in range(0, len(CONFIG["pairs"]), 10)]:
             for tf in CONFIG["timeframes"]:
@@ -1233,6 +1500,8 @@ async def monitor():
                                    f"💰 Entry: {sig['entry']:.4f} | 🛑 SL: {sig['sl']:.4f}\n"
                                    f"🎯 TPs: {tps_str} | ⚡ RR: {sig['rr']}\n"
                                    f"📋 Patterns: {patterns_str}")
+                            if sig.get('pattern_target'):
+                                msg += f"\n🎯 Pattern Target: {sig['pattern_target']:.4f}"
                             await send_telegram(msg)
                 except Exception as e:
                     logger.error(f"Error processing batch {symbol_batch}-{tf}: {str(e)}")
@@ -1250,7 +1519,6 @@ async def monitor():
             await send_telegram(status_msg)
         
         logger.info(f"CYCLE COMPLETE: Open: {len(open_signals)} | Total: {len(signal_history)} | Invalid Symbols: {len(invalid_symbols)}")
-        await exchange.close()
         await asyncio.sleep(CONFIG['scan_interval'])
 
 async def list_perpetual_futures_pairs(exchange: ccxt_async.Exchange) -> List[str]:
@@ -1283,4 +1551,8 @@ if __name__ == "__main__":
     logger.info(f"Scoring Plugins: {CONFIG['scoring_plugins']}")
     
     threading.Thread(target=run_flask, daemon=True).start()
-    asyncio.run(monitor())
+    try:
+        asyncio.run(monitor())
+    finally:
+        exchange = ccxt_async.binance(CONFIG["exchanges"]["binance"])
+        asyncio.run(exchange.close())
