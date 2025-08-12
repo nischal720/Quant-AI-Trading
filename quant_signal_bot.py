@@ -22,6 +22,7 @@ from typing import List, Dict, Optional, Tuple, Callable
 from collections import defaultdict
 import re
 from functools import wraps
+from motor.motor_asyncio import AsyncIOMotorClient
 
 warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -54,13 +55,12 @@ CONFIG = {
     },
     "pairs": ["BNB/USDT:USDT", "XRP/USDT:USDT", "SOL/USDT:USDT", "TON/USDT:USDT"],
     "timeframes": ["1h","2h", "4h", "1d"],
-    "conf_threshold": 80,  # Lowered for testing
+    "conf_threshold": 80,
     "atr_sl_mult": 1.8,
     "atr_tp_mult": 2.5,
     "adx_threshold": 25,
     "vol_mult": 2.0,
     "signal_lifetime_sec": 6*3600,
-    "log_file": "signals_log.jsonl",
     "ml_enabled": True,
     "ml_threshold": 0.65,
     "market_regime_enabled": True,
@@ -75,26 +75,33 @@ CONFIG = {
     "telegram_rate_limit": {"requests": 20, "window": 60},
     "indicator_plugins": ["ema", "rsi", "macd", "bbands", "stoch", "willr", "adx", "atr", "volatility", "obv", "cmf", "mfi", "candle_patterns", "order_flow", "vwap", "trendline"],
     "scoring_plugins": ["ema_alignment", "golden_cross", "rsi", "macd", "stoch", "adx", "volume", "bbands", "order_flow", "chart_patterns", "smc", "vwap", "trendline_breakout"],
-    "min_volume_multiple": 0.5,  # For data quality: min volume relative to MA
-    "min_body_ratio": 0.3,  # For bar quality: body / range >= this
-    "tf_weights": {"15m": 0.5,  "1h": 1.0, "2h": 1.2, "4h": 1.5, "1d": 2.0},  # Weighted TF confluence
-    "economic_calendar_url": "https://nfs.faireconomy.media/ff_calendar_thisweek.json",  # Free Forex Factory calendar
-    "event_impact_threshold": "high",  # Filter signals near high-impact events
-    "event_window_hours": 1,  # Avoid signals within 1 hour before/after events
-    "event_currencies": ["USD"]  # Filter economic events by these currencies
+    "min_volume_multiple": 0.5,
+    "min_body_ratio": 0.3,
+    "tf_weights": {"15m": 0.5,  "1h": 1.0, "2h": 1.2, "4h": 1.5, "1d": 2.0},
+    "economic_calendar_url": "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+    "event_impact_threshold": "high",
+    "event_window_hours": 1,
+    "event_currencies": ["USD"],
+    "mongodb": {
+        "uri": os.environ.get("MONGODB_URI", "mongodb://localhost:27017"),
+        "database": "crypto_trading_bot",
+        "collections": {
+            "signals": "signals",
+            "ohlcv": "ohlcv",
+            "model_performance": "model_performance",
+            "economic_events": "economic_events",
+            "ml_models": "ml_models",
+            "bot_state": "bot_state"
+        }
+    }
 }
 
 # Global state
 bot_status = {"status": "starting", "last_update": time.time(), "signals_count": 0}
-open_signals = {}
-signal_history = []
 semaphore = asyncio.Semaphore(10)
 live_data_cache = {}
-ohlcv_cache = {}
 invalid_symbols = set()
 fernet = Fernet(CONFIG["encryption_key"].encode())
-economic_events = []  # Cache for economic events
-economic_events_last_fetch = 0
 
 # Rate limiting storage
 flask_rate_limits = defaultdict(lambda: {"count": 0, "reset_time": 0})
@@ -103,6 +110,8 @@ telegram_rate_limits = defaultdict(lambda: {"count": 0, "reset_time": 0})
 # Initialize components
 bot = Bot(token=CONFIG["telegram_token"])
 app = Flask(__name__)
+mongo_client = AsyncIOMotorClient(CONFIG["mongodb"]["uri"])
+db = mongo_client[CONFIG["mongodb"]["database"]]
 
 # ================== SECURITY ENHANCEMENTS ==================
 def rate_limit(limit_type: str):
@@ -151,6 +160,16 @@ def home():
 def health():
     return "ok"
 
+@app.route('/mongo_health')
+@rate_limit("flask")
+async def mongo_health():
+    try:
+        await db.command("ping")
+        return json.dumps({"status": "MongoDB OK"})
+    except Exception as e:
+        logger.error(f"MongoDB health check failed: {str(e)}")
+        return json.dumps({"error": "MongoDB connection failed"}), 500
+
 def run_flask():
     app.run(host="0.0.0.0", port=10000)
 
@@ -184,7 +203,6 @@ class ScoringPlugin:
     def score(self, df: pd.DataFrame, direction: str, **context) -> Tuple[int, List[str]]:
         raise NotImplementedError
 
-# Indicator Plugins
 class EMAPlugin(IndicatorPlugin):
     def compute(self, df: pd.DataFrame) -> pd.DataFrame:
         df['ema20'] = pta.ema(df['close'], 20)
@@ -601,6 +619,61 @@ SCORING_PLUGINS = {
     "trendline_breakout": TrendLineBreakoutPlugin("trendline_breakout")
 }
 
+# ================== MONGODB INITIALIZATION ==================
+async def init_mongo_indexes():
+    signal_collection = db[CONFIG["mongodb"]["collections"]["signals"]]
+    ohlcv_collection = db[CONFIG["mongodb"]["collections"]["ohlcv"]]
+    economic_collection = db[CONFIG["mongodb"]["collections"]["economic_events"]]
+    performance_collection = db[CONFIG["mongodb"]["collections"]["model_performance"]]
+    ml_models_collection = db[CONFIG["mongodb"]["collections"]["ml_models"]]
+    bot_state_collection = db[CONFIG["mongodb"]["collections"]["bot_state"]]
+
+    # FIXED: Create proper indexes with correct fields
+    await ohlcv_collection.create_index([("cache_key", 1)])
+    await ohlcv_collection.create_index([("timestamp", 1)], expireAfterSeconds=CONFIG["cache_ttl"])
+    
+    await signal_collection.create_index([("key", 1), ("timestamp", -1)])
+    await signal_collection.create_index([("timestamp", 1)], expireAfterSeconds=30*24*60*60)
+    
+    await economic_collection.create_index([("date", -1)])
+    await performance_collection.create_index([("timestamp", -1)])
+    await ml_models_collection.create_index([("model_id", 1)], unique=True)
+    await bot_state_collection.create_index([("name", 1)], unique=True)
+    
+    logger.info("MongoDB indexes and TTLs created")
+
+# ================== STATE MANAGEMENT ==================
+async def save_bot_state():
+    try:
+        state_collection = db[CONFIG["mongodb"]["collections"]["bot_state"]]
+        await state_collection.update_one(
+            {"name": "global_state"},
+            {"$set": {
+                "bot_status": bot_status,
+                "invalid_symbols": list(invalid_symbols),
+                "last_update": datetime.now(timezone.utc)
+            }},
+            upsert=True
+        )
+        logger.info("Bot state saved to MongoDB")
+    except Exception as e:
+        logger.error(f"Error saving bot state: {str(e)}")
+
+async def load_bot_state():
+    try:
+        state_collection = db[CONFIG["mongodb"]["collections"]["bot_state"]]
+        state = await state_collection.find_one({"name": "global_state"})
+        if state:
+            global bot_status, invalid_symbols
+            bot_status = state.get("bot_status", bot_status)
+            invalid_symbols = set(state.get("invalid_symbols", []))
+            logger.info("Bot state loaded from MongoDB")
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Error loading bot state: {str(e)}")
+        return False
+
 # ================== DATA FETCHING ==================
 async def test_exchange_connectivity(exchange: ccxt_async.Exchange, url: str) -> bool:
     try:
@@ -659,16 +732,42 @@ async def fetch_ohlcv_batch(exchange: ccxt_async.Exchange, symbols: List[str], t
 
 async def fetch_ohlcv_single(exchange: ccxt_async.Exchange, symbol: str, timeframe: str, limit: int = 300) -> Optional[pd.DataFrame]:
     cache_key = f"{symbol}-{timeframe}"
-    if cache_key in ohlcv_cache and time.time() - ohlcv_cache[cache_key]["timestamp"] < CONFIG["cache_ttl"]:
-        logger.info(f"Using cached OHLCV data for {symbol}-{timeframe}")
-        return ohlcv_cache[cache_key]["data"]
-    
+    ohlcv_collection = db[CONFIG["mongodb"]["collections"]["ohlcv"]]
+
+    # Check MongoDB cache first
+    try:
+        cache_entry = await ohlcv_collection.find_one({"cache_key": cache_key})
+        if cache_entry and time.time() - cache_entry["timestamp"] < CONFIG["cache_ttl"]:
+            df = pd.DataFrame(cache_entry["data"])
+            df['ts'] = pd.to_datetime(df['ts'])
+            df.set_index('ts', inplace=True)
+            logger.info(f"Using MongoDB cached OHLCV data for {symbol}-{timeframe}")
+            return df
+    except Exception as e:
+        logger.error(f"Error checking MongoDB cache for {cache_key}: {str(e)}")
+
+    # Fetch from exchange if not cached
     try:
         data = await exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
         df = pd.DataFrame(data, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
         df['ts'] = pd.to_datetime(df['ts'], unit='ms')
         df.set_index('ts', inplace=True)
-        ohlcv_cache[cache_key] = {"data": df, "timestamp": time.time()}
+
+        # Save to MongoDB
+        try:
+            await ohlcv_collection.update_one(
+                {"cache_key": cache_key},
+                {"$set": {
+                    "cache_key": cache_key,
+                    "timestamp": time.time(),
+                    "data": df.reset_index().to_dict('records')
+                }},
+                upsert=True
+            )
+            logger.info(f"Saved OHLCV data to MongoDB for {cache_key}")
+        except Exception as e:
+            logger.error(f"Error saving OHLCV to MongoDB for {cache_key}: {str(e)}")
+
         logger.info(f"Fetched {len(df)} rows for {symbol}-{timeframe}")
         return df
     except ccxt_async.RateLimitExceeded as e:
@@ -699,23 +798,34 @@ async def fetch_live_price(exchange: ccxt_async.Exchange, symbol: str) -> Option
 
 # ================== ECONOMIC CALENDAR INTEGRATION ==================
 async def fetch_economic_calendar() -> List[Dict]:
-    global economic_events, economic_events_last_fetch
-    if time.time() - economic_events_last_fetch < 3600:
-        logger.info(f"Using cached economic events ({len(economic_events)} events)")
-        return economic_events
+    economic_collection = db[CONFIG["mongodb"]["collections"]["economic_events"]]
+
+    try:
+        cursor = economic_collection.find().sort("date", -1)
+        events = await cursor.to_list(length=1000)
+        if events:
+            logger.info(f"Using cached economic events from MongoDB ({len(events)} events)")
+            return events
+    except Exception as e:
+        logger.error(f"Error fetching economic events from MongoDB: {str(e)}")
+
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(CONFIG["economic_calendar_url"], timeout=10) as response:
                 if response.status == 200:
                     data = await response.json()
-                    economic_events = [
-                        event for event in data
+                    events = [
+                        {**event, "date": datetime.strptime(event["date"], '%Y-%m-%dT%H:%M:%S%z')}
+                        for event in data
                         if event.get('impact', '').lower() == CONFIG["event_impact_threshold"]
                         and event.get('currency', '') in CONFIG.get("event_currencies", ["USD"])
                     ]
-                    economic_events_last_fetch = time.time()
-                    logger.info(f"Fetched {len(economic_events)} high-impact events: {[event['date'] for event in economic_events[:5]]}")
-                    return economic_events
+                    # Save to MongoDB
+                    if events:
+                        await economic_collection.delete_many({})
+                        await economic_collection.insert_many(events)
+                        logger.info(f"Saved {len(events)} economic events to MongoDB")
+                    return events
                 else:
                     logger.error(f"Failed to fetch economic calendar: HTTP {response.status}")
                     return []
@@ -724,10 +834,11 @@ async def fetch_economic_calendar() -> List[Dict]:
         return []
 
 def is_near_event(current_time: datetime) -> bool:
-    for event in economic_events:
+    events = asyncio.run(fetch_economic_calendar())
+    for event in events:
         try:
-            event_time = datetime.strptime(event['date'], '%Y-%m-%dT%H:%M:%S%z')
-            time_diff_hours = abs((current_time - event_time.replace(tzinfo=timezone.utc)).total_seconds()) / 3600
+            event_time = event['date']
+            time_diff_hours = abs((current_time - event_time.replace(tzinfo=timezone.utc)).total_seconds() / 3600)
             if time_diff_hours <= CONFIG["event_window_hours"]:
                 logger.info(f"Near event detected: {event['title']} at {event['date']} (Impact: {event['impact']}, Diff: {time_diff_hours:.2f} hours)")
                 return True
@@ -759,7 +870,7 @@ def apply_indicators(df: pd.DataFrame) -> pd.DataFrame:
             logger.warning(f"All values in {col} are NaN")
     return df.fillna(method='ffill').fillna(0)
 
-# ================== GOLDEN CROSS DETECTION ==================
+# ================== SIGNAL GENERATION HELPERS ==================
 def detect_golden_cross(df: pd.DataFrame) -> Optional[str]:
     if len(df) < 2 or 'ema50' not in df or 'ema200' not in df:
         return None
@@ -771,7 +882,6 @@ def detect_golden_cross(df: pd.DataFrame) -> Optional[str]:
         return "death"
     return None
 
-# ================== CHART PATTERN DETECTION ==================
 def get_chart_patterns(df: pd.DataFrame) -> List[str]:
     patterns = []
     tol, lookback = 0.01, 20
@@ -873,7 +983,6 @@ def get_chart_patterns(df: pd.DataFrame) -> List[str]:
     
     return patterns
 
-# ================== SMC & STRUCTURE ANALYSIS ==================
 def detect_fvg(df: pd.DataFrame, window: int = 3) -> List[Tuple[str, int]]:
     gaps = []
     for i in range(window, len(df) - window):
@@ -903,7 +1012,6 @@ def detect_bos_choch(df: pd.DataFrame, lookback: int = 20) -> Optional[str]:
         return "down_bos"
     return None
 
-# ================== MARKET REGIME DETECTION ==================
 def detect_market_regime(df: pd.DataFrame) -> str:
     adx_avg = df['adx'].tail(10).mean() if 'adx' in df else 0
     volatility_avg = df['volatility'].tail(10).mean() if 'volatility' in df else 0
@@ -920,7 +1028,6 @@ def detect_market_regime(df: pd.DataFrame) -> str:
     else:
         return "neutral"
 
-# ================== MULTI-TIMEFRAME CONFLUENCE ==================
 async def multi_timeframe_confluence(exchange: ccxt_async.Exchange, symbol: str) -> Tuple[int, Dict]:
     confluence_score = 0
     tf_data = {}
@@ -954,7 +1061,7 @@ async def fetch_and_analyze_tf(exchange: ccxt_async.Exchange, symbol: str, timef
         logger.error(f"Error analyzing {symbol}-{timeframe}: {str(e)}")
         return None, 0
 
-# ================== OPTIMIZED ML CLASSIFIER ==================
+# ================== MACHINE LEARNING MODEL ==================
 class OptimizedCryptoMLClassifier:
     def __init__(self):
         self.models = {}
@@ -1148,47 +1255,65 @@ class OptimizedCryptoMLClassifier:
             logger.error(f"Prediction error: {str(e)}")
             return 0.5, 0
 
-    def save_model(self, filepath: str = 'optimized_crypto_ml_model.pkl') -> bool:
+    async def save_model(self, model_id: str = "primary") -> bool:
         try:
-            os.makedirs(os.path.dirname(filepath) or '.', exist_ok=True)  # Create directory if it doesn't exist
-            model_data = pickle.dumps({
+            model_data = {
                 'model': self.models.get('best'),
                 'scaler': self.scalers.get('best'),
                 'feature_names': self.feature_names,
                 'performance': self.performance_history,
-                'last_retrained': self.last_retrained
-            })
-            encrypted_data = fernet.encrypt(model_data)
-            with open(filepath, 'wb') as f:
-                f.write(encrypted_data)
-            logger.info(f"Model saved to {filepath}")
+                'last_retrained': self.last_retrained,
+                'timestamp': datetime.now(timezone.utc)
+            }
+            
+            serialized = pickle.dumps(model_data)
+            encrypted_data = fernet.encrypt(serialized)
+            
+            ml_models = db[CONFIG["mongodb"]["collections"]["ml_models"]]
+            await ml_models.update_one(
+                {"model_id": model_id},
+                {"$set": {
+                    "model_id": model_id,
+                    "data": encrypted_data,
+                    "timestamp": datetime.now(timezone.utc),
+                    "performance": self.performance_history
+                }},
+                upsert=True
+            )
+            logger.info(f"Model saved to MongoDB with ID: {model_id}")
             return True
         except Exception as e:
-            logger.error(f"Error saving model: {str(e)}")
+            logger.error(f"Error saving model to MongoDB: {str(e)}")
             return False
 
-    def load_model(self, filepath: str = 'optimized_crypto_ml_model.pkl') -> bool:
+    async def load_model(self, model_id: str = "primary") -> bool:
         try:
-            with open(filepath, 'rb') as f:
-                encrypted_data = f.read()
-            model_data = pickle.loads(fernet.decrypt(encrypted_data))
+            ml_models = db[CONFIG["mongodb"]["collections"]["ml_models"]]
+            model_doc = await ml_models.find_one({"model_id": model_id})
+            if model_doc is None:
+                logger.warning(f"No model found in MongoDB with ID: {model_id}")
+                return False
+            encrypted_data = model_doc['data']
+            serialized = fernet.decrypt(encrypted_data)
+            model_data = pickle.loads(serialized)
+            
             self.models['best'] = model_data.get('model')
             self.scalers['best'] = model_data.get('scaler')
             self.feature_names = model_data.get('feature_names', [])
             self.performance_history = model_data.get('performance', {})
             self.last_retrained = model_data.get('last_retrained', 0)
-            logger.info(f"Model loaded from {filepath}")
+            logger.info(f"Model loaded from MongoDB: {model_id}")
             if self.performance_history:
                 logger.info(f"ML Performance: Test {self.performance_history.get('test_score', 0):.3f}, AUC {self.performance_history.get('auc_score', 0):.3f}")
             return True
         except Exception as e:
-            logger.error(f"Error loading model: {str(e)}")
+            logger.error(f"Error loading model from MongoDB: {str(e)}")
             return False
 
 ml_classifier = OptimizedCryptoMLClassifier()
 
 async def ensure_ml_model(exchange: ccxt_async.Exchange, valid_pairs: List[str], timeframes: List[str]) -> bool:
-    if ml_classifier.load_model():
+    if await ml_classifier.load_model():
         logger.info("Existing ML model loaded successfully")
         return True
 
@@ -1198,7 +1323,7 @@ async def ensure_ml_model(exchange: ccxt_async.Exchange, valid_pairs: List[str],
             logger.info(f"Training ML model with {symbol} on {timeframe}")
             try:
                 if await ml_classifier.train_model(exchange, symbol, timeframe):
-                    ml_classifier.save_model()
+                    await ml_classifier.save_model()
                     logger.info(f"Model trained and saved successfully for {symbol}-{timeframe}")
                     return True
                 else:
@@ -1318,69 +1443,7 @@ def get_enhanced_signal(df: pd.DataFrame, chart_patterns: List[str], fvg: List, 
             logger.info(f"{symbol}:{direction} Score {total_score} below threshold {CONFIG['conf_threshold']}")
     return None
 
-# ================== LIVE DATA MONITORING ==================
-async def monitor_live_data(exchange: ccxt_async.Exchange):
-    while True:
-        try:
-            for symbol in CONFIG["pairs"]:
-                if symbol in invalid_symbols:
-                    continue
-                live_price = await fetch_live_price(exchange, symbol)
-                if live_price:
-                    live_data_cache[symbol]["price"] = live_price
-
-            current_time = time.time()
-            signals_to_remove = []
-            for sig_key, signal in list(open_signals.items()):
-                symbol = sig_key.split('-')[0]
-                if symbol in invalid_symbols:
-                    signals_to_remove.append(sig_key)
-                    continue
-                live_price = live_data_cache.get(symbol, {}).get("price")
-                if not live_price:
-                    continue
-                if current_time - signal['timestamp'] > CONFIG['signal_lifetime_sec']:
-                    signals_to_remove.append(sig_key)
-                    await send_telegram(f"⌛ {symbol} signal expired ({signal['direction']})")
-                    update_signal_outcome(sig_key, 0)
-                    continue
-                direction = signal['direction']
-                entry = signal['entry']
-                sl = signal['sl']
-                tps = signal['tps']
-                if direction == "LONG":
-                    if live_price <= sl:
-                        await send_telegram(f"📉 {symbol} LONG Stop Loss hit at {live_price:.4f}")
-                        update_signal_outcome(sig_key, 0)
-                        signals_to_remove.append(sig_key)
-                    else:
-                        for i, tp in enumerate(tps):
-                            if live_price >= tp:
-                                await send_telegram(f"📈 {symbol} LONG Take Profit #{i+1} hit at {live_price:.4f}")
-                                if i == len(tps) - 1:
-                                    update_signal_outcome(sig_key, 1)
-                                    signals_to_remove.append(sig_key)
-                else:  # SHORT
-                    if live_price >= sl:
-                        await send_telegram(f"📈 {symbol} SHORT Stop Loss hit at {live_price:.4f}")
-                        update_signal_outcome(sig_key, 0)
-                        signals_to_remove.append(sig_key)
-                    else:
-                        for i, tp in enumerate(tps):
-                            if live_price <= tp:
-                                await send_telegram(f"📉 {symbol} SHORT Take Profit #{i+1} hit at {live_price:.4f}")
-                                if i == len(tps) - 1:
-                                    update_signal_outcome(sig_key, 1)
-                                    signals_to_remove.append(sig_key)
-            
-            for sig_key in set(signals_to_remove):
-                open_signals.pop(sig_key, None)
-            await asyncio.sleep(CONFIG['live_data_interval'])
-        except Exception as e:
-            logger.error(f"Live monitor error: {str(e)}")
-            await asyncio.sleep(10)
-
-# ================== TELEGRAM & LOGGING ==================
+# ================== TELEGRAM & SIGNAL MANAGEMENT ==================
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(5))
 @rate_limit("telegram")
 async def send_telegram(text: str) -> bool:
@@ -1401,29 +1464,186 @@ async def send_telegram(text: str) -> bool:
         logger.error(f"Telegram error: {str(e)}")
         return False
 
-def log_signal(signal: Dict):
-    with open(CONFIG['log_file'], 'a') as f:
-        f.write(json.dumps(signal, default=str) + "\n")
+async def log_signal(signal: Dict):
+    try:
+        signal_collection = db[CONFIG["mongodb"]["collections"]["signals"]]
+        signal_copy = signal.copy()
+        signal_copy["timestamp"] = datetime.fromtimestamp(signal_copy["timestamp"], tz=timezone.utc)
+        signal_copy["bar_ts"] = pd.to_datetime(signal_copy["bar_ts"])
+        await signal_collection.insert_one(signal_copy)
+        logger.info(f"Signal saved to MongoDB for {signal['key']}")
+    except Exception as e:
+        logger.error(f"Error saving signal to MongoDB: {str(e)}")
 
-def clean_stale_signals(signals: Dict) -> Dict:
+async def get_signal_history(symbol: str = None, timeframe: str = None, limit: int = 1000) -> List[Dict]:
+    try:
+        signal_collection = db[CONFIG["mongodb"]["collections"]["signals"]]
+        query = {}
+        if symbol:
+            query["key"] = {"$regex": f"^{symbol}-"}
+        if timeframe:
+            query["key"] = {"$regex": f"-{timeframe}-"}
+        cursor = signal_collection.find(query).sort("timestamp", -1).limit(limit)
+        signals = await cursor.to_list(length=limit)
+        for signal in signals:
+            signal["_id"] = str(signal["_id"])
+            signal["timestamp"] = signal["timestamp"].timestamp()
+            signal["bar_ts"] = signal["bar_ts"].timestamp()
+        return signals
+    except Exception as e:
+        logger.error(f"Error fetching signal history: {str(e)}")
+        return []
+
+async def get_open_signals() -> Dict[str, Dict]:
+    try:
+        signal_collection = db[CONFIG["mongodb"]["collections"]["signals"]]
+        cursor = signal_collection.find({"status": "open"}).sort("timestamp", -1)
+        signals = await cursor.to_list(length=1000)
+        return {s["key"]: {**s, "_id": str(s["_id"]), "timestamp": s["timestamp"].timestamp(), "bar_ts": s["bar_ts"].timestamp()} for s in signals}
+    except Exception as e:
+        logger.error(f"Error fetching open signals: {str(e)}")
+        return {}
+
+async def update_open_signal(signal: Dict, status: str = "open"):
+    try:
+        signal_collection = db[CONFIG["mongodb"]["collections"]["signals"]]
+        await signal_collection.update_one(
+            {"key": signal["key"], "timestamp": datetime.fromtimestamp(signal["timestamp"], tz=timezone.utc)},
+            {"$set": {"status": status}},
+            upsert=True
+        )
+    except Exception as e:
+        logger.error(f"Error updating signal status: {str(e)}")
+
+async def update_signal_outcome(signal_key: str, outcome: int):
+    try:
+        signal_collection = db[CONFIG["mongodb"]["collections"]["signals"]]
+        await signal_collection.update_one(
+            {"key": signal_key},
+            {"$set": {"outcome": outcome}}
+        )
+    except Exception as e:
+        logger.error(f"Error updating signal outcome: {str(e)}")
+
+async def clean_stale_signals(open_signals: Dict) -> Dict:
     now = time.time()
-    return {k: v for k, v in signals.items() if now - v['timestamp'] < CONFIG['signal_lifetime_sec']}
+    signals_to_remove = []
+    for sig_key, signal in open_signals.items():
+        if now - signal["timestamp"] > CONFIG["signal_lifetime_sec"]:
+            signals_to_remove.append(sig_key)
+            await update_open_signal(signal, status="expired")
+            await send_telegram(f"⌛ {sig_key.split('-')[0]} signal expired ({signal['direction']})")
+            await update_signal_outcome(sig_key, 0)
+    for sig_key in signals_to_remove:
+        open_signals.pop(sig_key, None)
+    return open_signals
 
-def update_signal_outcome(signal_key: str, outcome: int):
-    for signal in signal_history:
-        if signal.get('key') == signal_key:
-            signal['outcome'] = outcome
-            break
+async def check_storage_usage():
+    stats = await db.command("dbStats")
+    storage_mb = stats["storageSize"] / (1024 * 1024)
+    logger.info(f"Current storage usage: {storage_mb:.2f} MB")
+    return storage_mb
+
+async def analyze_signal_performance(symbol: str = None):
+    try:
+        signal_collection = db[CONFIG["mongodb"]["collections"]["signals"]]
+        query = {"outcome": {"$exists": True}}
+        if symbol:
+            query["key"] = {"$regex": f"^{symbol}-"}
+        pipeline = [
+            {"$match": query},
+            {"$group": {
+                "_id": {"$arrayElemAt": [{"$split": ["$key", "-"]}, 0]},
+                "total": {"$sum": 1},
+                "wins": {"$sum": {"$cond": [{"$eq": ["$outcome", 1]}, 1, 0]}}
+            }},
+            {"$project": {
+                "symbol": "$_id",
+                "win_rate": {"$divide": ["$wins", "$total"]},
+                "total": 1
+            }}
+        ]
+        results = await signal_collection.aggregate(pipeline).to_list(length=100)
+        for res in results:
+            logger.info(f"Symbol: {res['symbol']}, Win Rate: {res['win_rate']:.2%}, Total Signals: {res['total']}")
+    except Exception as e:
+        logger.error(f"Error analyzing signal performance: {str(e)}")
+
+# ================== LIVE DATA MONITORING ==================
+async def monitor_live_data(exchange: ccxt_async.Exchange):
+    while True:
+        try:
+            for symbol in CONFIG["pairs"]:
+                if symbol in invalid_symbols:
+                    continue
+                live_price = await fetch_live_price(exchange, symbol)
+                if live_price:
+                    live_data_cache[symbol] = {"price": live_price, "timestamp": time.time()}
+
+            current_time = time.time()
+            open_signals = await get_open_signals()
+            open_signals = await clean_stale_signals(open_signals)
+            
+            signals_to_remove = []
+            for sig_key, signal in open_signals.items():
+                symbol = sig_key.split('-')[0]
+                if symbol in invalid_symbols:
+                    signals_to_remove.append(sig_key)
+                    continue
+                live_price = live_data_cache.get(symbol, {}).get("price")
+                if not live_price:
+                    continue
+                
+                direction = signal['direction']
+                entry = signal['entry']
+                sl = signal['sl']
+                tps = signal['tps']
+                
+                if direction == "LONG":
+                    if live_price <= sl:
+                        await send_telegram(f"📉 {symbol} LONG Stop Loss hit at {live_price:.4f}")
+                        await update_signal_outcome(sig_key, 0)
+                        signals_to_remove.append(sig_key)
+                    else:
+                        for i, tp in enumerate(tps):
+                            if live_price >= tp:
+                                await send_telegram(f"📈 {symbol} LONG Take Profit #{i+1} hit at {live_price:.4f}")
+                                if i == len(tps) - 1:
+                                    await update_signal_outcome(sig_key, 1)
+                                    signals_to_remove.append(sig_key)
+                else:  # SHORT
+                    if live_price >= sl:
+                        await send_telegram(f"📈 {symbol} SHORT Stop Loss hit at {live_price:.4f}")
+                        await update_signal_outcome(sig_key, 0)
+                        signals_to_remove.append(sig_key)
+                    else:
+                        for i, tp in enumerate(tps):
+                            if live_price <= tp:
+                                await send_telegram(f"📉 {symbol} SHORT Take Profit #{i+1} hit at {live_price:.4f}")
+                                if i == len(tps) - 1:
+                                    await update_signal_outcome(sig_key, 1)
+                                    signals_to_remove.append(sig_key)
+            
+            for sig_key in set(signals_to_remove):
+                if sig_key in open_signals:
+                    await update_open_signal(open_signals[sig_key], status="closed")
+            
+            await asyncio.sleep(CONFIG['live_data_interval'])
+        except Exception as e:
+            logger.error(f"Live monitor error: {str(e)}")
+            await asyncio.sleep(10)
 
 # ================== MAIN MONITORING LOOP ==================
 async def monitor():
-    global open_signals, signal_history, economic_events
     validate_config()
     exchange = ccxt_async.binance(CONFIG["exchanges"]["binance"])
     
     if not await test_exchange_connectivity(exchange, CONFIG["exchanges"]["binance"]["urls"]["api"]["public"]):
         logger.error("Cannot connect to Binance API. Exiting...")
         sys.exit(1)
+
+    await init_mongo_indexes()
+    await load_bot_state()
 
     valid_pairs = await validate_symbols(exchange)
     CONFIG["pairs"] = valid_pairs
@@ -1444,19 +1664,17 @@ async def monitor():
     while True:
         cycle_count += 1
         logger.info(f"Starting analysis cycle #{cycle_count}")
-        open_signals = clean_stale_signals(open_signals)
+        open_signals = await get_open_signals()
+        open_signals = await clean_stale_signals(open_signals)
 
-        if CONFIG['ml_enabled'] and len(signal_history) > 100:
+        if CONFIG['ml_enabled'] and len(await get_signal_history()) > 100:
             retrain_counter += 1
             if retrain_counter % 24 == 0:
                 logger.info("Periodic model retraining...")
-                outcomes = [s for s in signal_history if 'outcome' in s]
+                outcomes = [s for s in await get_signal_history() if 'outcome' in s]
                 if len(outcomes) >= 100:
                     if await ml_classifier.train_model(exchange, valid_pairs[0], CONFIG["timeframes"][0]):
-                        ml_classifier.save_model()
-
-        if cycle_count % 6 == 0:
-            economic_events = await fetch_economic_calendar()
+                        await ml_classifier.save_model()
 
         current_dt = datetime.now(timezone.utc)
         if economic_events and is_near_event(current_dt):
@@ -1489,9 +1707,8 @@ async def monitor():
                                 continue
                             cross_info = " | ✨ Golden Cross" if golden_cross == "golden" else " | ☠️ Death Cross" if golden_cross == "death" else ""
                             logger.info(f"SIGNAL: {symbol} {tf} {sig['direction']} | Score: {sig['score']} | ML: {sig['ml_confidence']:.3f}{cross_info}")
-                            open_signals[sig_key] = sig
-                            signal_history.append(sig)
-                            log_signal(sig)
+                            await update_open_signal(sig, status="open")
+                            await log_signal(sig)
                             tps_str = ', '.join(f"{tp:.4f}" for tp in sig['tps'])
                             patterns_str = ', '.join(sig['patterns'][:3]) if sig['patterns'] else "None"
                             msg = (f"🤖 ENHANCED SIGNAL\n"
@@ -1508,6 +1725,7 @@ async def monitor():
                 await asyncio.sleep(3)
         
         if cycle_count % 6 == 0:
+            signal_history = await get_signal_history(limit=1000)
             status_msg = (f"📊 BOT STATUS\n"
                           f"🔄 Cycle: #{cycle_count} | ⏱ Uptime: {timedelta(seconds=int(time.time()-bot_status['last_update']))}\n"
                           f"📈 Active Signals: {len(open_signals)}\n"
@@ -1517,42 +1735,31 @@ async def monitor():
                 perf = ml_classifier.performance_history
                 status_msg += f"\n🤖 ML Perf: Test {perf.get('test_score', 0):.3f} | AUC {perf.get('auc_score', 0):.3f}"
             await send_telegram(status_msg)
+            await check_storage_usage()
         
+        if cycle_count % 12 == 0:
+            await analyze_signal_performance()
+            
+        await save_bot_state()
         logger.info(f"CYCLE COMPLETE: Open: {len(open_signals)} | Total: {len(signal_history)} | Invalid Symbols: {len(invalid_symbols)}")
         await asyncio.sleep(CONFIG['scan_interval'])
-
-async def list_perpetual_futures_pairs(exchange: ccxt_async.Exchange) -> List[str]:
-    try:
-        await exchange.load_markets(reload=True)
-        markets = exchange.markets
-        perpetual_pairs = [
-            symbol for symbol, market in markets.items()
-            if market.get('active', False) and
-               market.get('type') == 'swap' and
-               market.get('linear', False) and
-               symbol.endswith('USDT')
-        ]
-        logger.info(f"Available Binance Perpetual Futures Pairs ({len(perpetual_pairs)}): {perpetual_pairs[:20]}")
-        return perpetual_pairs
-    except Exception as e:
-        logger.error(f"Failed to list perpetual futures pairs: {str(e)}")
-        return []
-    finally:
-        await exchange.close()
 
 # ================== MAIN ENTRY POINT ==================
 if __name__ == "__main__":
     logger.info("🚀 Enhanced Crypto Quant Trading Bot")
-    logger.info("✨ Plugin System | Parallel Multi-TF | Secure Flask/Telegram")
+    logger.info("✨ MongoDB Storage | Plugin System | Parallel Multi-TF")
     logger.info(f"Symbols: {len(CONFIG['pairs'])}")
     logger.info(f"Timeframes: {CONFIG['timeframes']}")
     logger.info(f"ML Enabled: {CONFIG['ml_enabled']}")
-    logger.info(f"Indicator Plugins: {CONFIG['indicator_plugins']}")
-    logger.info(f"Scoring Plugins: {CONFIG['scoring_plugins']}")
     
     threading.Thread(target=run_flask, daemon=True).start()
     try:
         asyncio.run(monitor())
+    except KeyboardInterrupt:
+        logger.info("Shutting down gracefully...")
+        asyncio.run(save_bot_state())
     finally:
         exchange = ccxt_async.binance(CONFIG["exchanges"]["binance"])
-        asyncio.run(exchange.close())
+        exchange.close()
+        mongo_client.close()
+        logger.info("Resources released. Goodbye!")
