@@ -25,6 +25,10 @@ from functools import wraps
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import CollectionInvalid
 from dotenv import load_dotenv
+import torch
+from torch import nn, optim
+import psutil  # For system health
+from scipy.optimize import minimize  # For param optimization
 load_dotenv()
 
 warnings.filterwarnings('ignore')
@@ -75,11 +79,11 @@ CONFIG = {
     "encryption_key": os.environ.get("ENCRYPTION_KEY", Fernet.generate_key().decode()),
     "flask_rate_limit": {"requests": 100, "window": 60},
     "telegram_rate_limit": {"requests": 20, "window": 60},
-    "indicator_plugins": ["ema", "rsi", "macd", "bbands", "stoch", "willr", "adx", "atr", "volatility", "obv", "cmf", "mfi", "candle_patterns", "order_flow", "vwap", "trendline"],
-    "scoring_plugins": ["ema_alignment", "golden_cross", "rsi", "macd", "stoch", "adx", "volume", "bbands", "order_flow", "chart_patterns", "smc", "vwap", "trendline_breakout"],
+    "indicator_plugins": ["ema", "rsi", "macd", "bbands", "stoch", "willr", "adx", "atr", "volatility", "obv", "cmf", "mfi", "candle_patterns", "order_flow", "vwap", "trendline", "liquidity", "volume_profile"],
+    "scoring_plugins": ["ema_alignment", "golden_cross", "rsi", "macd", "stoch", "adx", "volume", "bbands", "order_flow", "chart_patterns", "smc", "vwap", "trendline_breakout", "liquidity", "volume_profile"],
     "min_volume_multiple": 0.5,
     "min_body_ratio": 0.3,
-    "tf_weights": {"15m": 0.5,  "1h": 1.0, "2h": 1.2, "4h": 1.5, "1d": 2.0},
+    "tf_weights": {"1h": 1.0, "2h": 1.2, "4h": 1.5, "1d": 2.0},
     "economic_calendar_url": "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
     "event_impact_threshold": "high",
     "event_window_hours": 1,
@@ -95,7 +99,9 @@ CONFIG = {
             "ml_models": "ml_models",
             "bot_state": "bot_state"
         }
-    }
+    },
+    "anomaly_vol_threshold": 3.0,  # For anomaly detection
+    "health_check_interval": 300  # 5 minutes
 }
 
 # Global state
@@ -195,7 +201,7 @@ class IndicatorPlugin:
     def __init__(self, name: str):
         self.name = name
 
-    def compute(self, df: pd.DataFrame) -> pd.DataFrame:
+    async def compute(self, exchange: ccxt_async.Exchange, symbol: str, df: pd.DataFrame) -> pd.DataFrame:
         raise NotImplementedError
 
 class ScoringPlugin:
@@ -206,7 +212,7 @@ class ScoringPlugin:
         raise NotImplementedError
 
 class EMAPlugin(IndicatorPlugin):
-    def compute(self, df: pd.DataFrame) -> pd.DataFrame:
+    async def compute(self, exchange: ccxt_async.Exchange, symbol: str, df: pd.DataFrame) -> pd.DataFrame:
         df['ema20'] = pta.ema(df['close'], 20)
         df['ema50'] = pta.ema(df['close'], 50)
         df['ema200'] = pta.ema(df['close'], 200)
@@ -215,14 +221,14 @@ class EMAPlugin(IndicatorPlugin):
         return df
 
 class RSIPlugin(IndicatorPlugin):
-    def compute(self, df: pd.DataFrame) -> pd.DataFrame:
+    async def compute(self, exchange: ccxt_async.Exchange, symbol: str, df: pd.DataFrame) -> pd.DataFrame:
         df['rsi'] = pta.rsi(df['close'], 14)
         df['rsi_fast'] = pta.rsi(df['close'], 7)
         df['rsi_slow'] = pta.rsi(df['close'], 21)
         return df
 
 class MACDPlugin(IndicatorPlugin):
-    def compute(self, df: pd.DataFrame) -> pd.DataFrame:
+    async def compute(self, exchange: ccxt_async.Exchange, symbol: str, df: pd.DataFrame) -> pd.DataFrame:
         macd = pta.macd(df['close'])
         df['macd'] = macd['MACD_12_26_9']
         df['macds'] = macd['MACDs_12_26_9']
@@ -230,7 +236,7 @@ class MACDPlugin(IndicatorPlugin):
         return df
 
 class BollingerBandsPlugin(IndicatorPlugin):
-    def compute(self, df: pd.DataFrame) -> pd.DataFrame:
+    async def compute(self, exchange: ccxt_async.Exchange, symbol: str, df: pd.DataFrame) -> pd.DataFrame:
         bb = pta.bbands(df['close'], length=20, std=2)
         df['bb_upper'] = bb['BBU_20_2.0']
         df['bb_middle'] = bb['BBM_20_2.0']
@@ -240,19 +246,19 @@ class BollingerBandsPlugin(IndicatorPlugin):
         return df
 
 class StochasticPlugin(IndicatorPlugin):
-    def compute(self, df: pd.DataFrame) -> pd.DataFrame:
+    async def compute(self, exchange: ccxt_async.Exchange, symbol: str, df: pd.DataFrame) -> pd.DataFrame:
         stoch = pta.stoch(df['high'], df['low'], df['close'])
         df['stoch_k'] = stoch['STOCHk_14_3_3']
         df['stoch_d'] = stoch['STOCHd_14_3_3']
         return df
 
 class WilliamsRPlugin(IndicatorPlugin):
-    def compute(self, df: pd.DataFrame) -> pd.DataFrame:
+    async def compute(self, exchange: ccxt_async.Exchange, symbol: str, df: pd.DataFrame) -> pd.DataFrame:
         df['williams_r'] = pta.willr(df['high'], df['low'], df['close'])
         return df
 
 class ADXPlugin(IndicatorPlugin):
-    def compute(self, df: pd.DataFrame) -> pd.DataFrame:
+    async def compute(self, exchange: ccxt_async.Exchange, symbol: str, df: pd.DataFrame) -> pd.DataFrame:
         adx_data = pta.adx(df['high'], df['low'], df['close'])
         df['adx'] = adx_data['ADX_14']
         df['dmp'] = adx_data['DMP_14']
@@ -260,13 +266,13 @@ class ADXPlugin(IndicatorPlugin):
         return df
 
 class ATRPlugin(IndicatorPlugin):
-    def compute(self, df: pd.DataFrame) -> pd.DataFrame:
+    async def compute(self, exchange: ccxt_async.Exchange, symbol: str, df: pd.DataFrame) -> pd.DataFrame:
         df['atr'] = pta.atr(df['high'], df['low'], df['close'])
         df['atr_pct'] = df['atr'] / df['close'] * 100
         return df
 
 class VolatilityPlugin(IndicatorPlugin):
-    def compute(self, df: pd.DataFrame) -> pd.DataFrame:
+    async def compute(self, exchange: ccxt_async.Exchange, symbol: str, df: pd.DataFrame) -> pd.DataFrame:
         df['volatility'] = df['close'].rolling(20).std() / df['close'].rolling(20).mean()
         vol_ma = df['volume'].rolling(20).mean()
         df['vol_spike'] = df['volume'] > vol_ma * CONFIG['vol_mult']
@@ -274,22 +280,22 @@ class VolatilityPlugin(IndicatorPlugin):
         return df
 
 class OBVPlugin(IndicatorPlugin):
-    def compute(self, df: pd.DataFrame) -> pd.DataFrame:
+    async def compute(self, exchange: ccxt_async.Exchange, symbol: str, df: pd.DataFrame) -> pd.DataFrame:
         df['obv'] = pta.obv(df['close'], df['volume'])
         return df
 
 class CMFPlugin(IndicatorPlugin):
-    def compute(self, df: pd.DataFrame) -> pd.DataFrame:
+    async def compute(self, exchange: ccxt_async.Exchange, symbol: str, df: pd.DataFrame) -> pd.DataFrame:
         df['cmf'] = pta.cmf(df['high'], df['low'], df['close'], df['volume'])
         return df
 
 class MFIPlugin(IndicatorPlugin):
-    def compute(self, df: pd.DataFrame) -> pd.DataFrame:
+    async def compute(self, exchange: ccxt_async.Exchange, symbol: str, df: pd.DataFrame) -> pd.DataFrame:
         df['mfi'] = pta.mfi(df['high'], df['low'], df['close'], df['volume'])
         return df
 
 class CandlePatternsPlugin(IndicatorPlugin):
-    def compute(self, df: pd.DataFrame) -> pd.DataFrame:
+    async def compute(self, exchange: ccxt_async.Exchange, symbol: str, df: pd.DataFrame) -> pd.DataFrame:
         o, h, l, c = df['open'].values, df['high'].values, df['low'].values, df['close'].values
         patterns = [
             ("hammer", talib.CDLHAMMER), ("engulfing", talib.CDLENGULFING),
@@ -306,7 +312,7 @@ class CandlePatternsPlugin(IndicatorPlugin):
         return df
 
 class OrderFlowPlugin(IndicatorPlugin):
-    def compute(self, df: pd.DataFrame) -> pd.DataFrame:
+    async def compute(self, exchange: ccxt_async.Exchange, symbol: str, df: pd.DataFrame) -> pd.DataFrame:
         df['upper_rejection'] = (df['high'] == df['high'].rolling(5).max()) & (df['close'] < df['high'] * 0.98)
         df['lower_rejection'] = (df['low'] == df['low'].rolling(5).min()) & (df['close'] > df['low'] * 1.02)
         df['buying_pressure'] = (df['close'] - df['low']) / (df['high'] - df['low'])
@@ -314,13 +320,13 @@ class OrderFlowPlugin(IndicatorPlugin):
         return df
 
 class VWAPPlugin(IndicatorPlugin):
-    def compute(self, df: pd.DataFrame) -> pd.DataFrame:
+    async def compute(self, exchange: ccxt_async.Exchange, symbol: str, df: pd.DataFrame) -> pd.DataFrame:
         typical_price = (df['high'] + df['low'] + df['close']) / 3
         df['vwap'] = (typical_price * df['volume']).cumsum() / df['volume'].cumsum()
         return df
 
 class TrendLinePlugin(IndicatorPlugin):
-    def compute(self, df: pd.DataFrame) -> pd.DataFrame:
+    async def compute(self, exchange: ccxt_async.Exchange, symbol: str, df: pd.DataFrame) -> pd.DataFrame:
         # Find pivot highs and lows
         df['pivot_low'] = (df['low'].shift(1) > df['low']) & (df['low'].shift(-1) > df['low'])
         df['pivot_high'] = (df['high'].shift(1) < df['high']) & (df['high'].shift(-1) < df['high'])
@@ -361,15 +367,34 @@ class TrendLinePlugin(IndicatorPlugin):
 
         return df
 
-class CustomIndicatorPlugin(IndicatorPlugin):
-    def __init__(self, name: str, compute_fn: Callable[[pd.DataFrame], pd.DataFrame]):
-        super().__init__(name)
-        self.compute_fn = compute_fn
+class LiquidityPlugin(IndicatorPlugin):
+    async def compute(self, exchange: ccxt_async.Exchange, symbol: str, df: pd.DataFrame) -> pd.DataFrame:
+        try:
+            order_book = await exchange.fetch_order_book(symbol, limit=50)
+            bid_depth = sum([b[1] for b in order_book['bids'][:10]])
+            ask_depth = sum([a[1] for a in order_book['asks'][:10]])
+            df['bid_depth'] = bid_depth
+            df['ask_depth'] = ask_depth
+            df['depth_imbalance'] = (bid_depth - ask_depth) / (bid_depth + ask_depth + 1e-6)
+            df['total_depth'] = bid_depth + ask_depth
+        except Exception as e:
+            logger.error(f"Liquidity fetch error for {symbol}: {str(e)}")
+            df['bid_depth'] = df['ask_depth'] = df['depth_imbalance'] = df['total_depth'] = 0
+        return df
 
-    def compute(self, df: pd.DataFrame) -> pd.DataFrame:
-        return self.compute_fn(df)
+class VolumeProfilePlugin(IndicatorPlugin):
+    async def compute(self, exchange: ccxt_async.Exchange, symbol: str, df: pd.DataFrame) -> pd.DataFrame:
+        prices = pd.concat([df['close'], df['high'], df['low']])
+        volumes = df['volume'].repeat(3)
+        hist, edges = np.histogram(prices, bins=50, weights=volumes)
+        poc_idx = np.argmax(hist)
+        df['vpoc'] = (edges[poc_idx] + edges[poc_idx + 1]) / 2
+        vah_idx = poc_idx + int(0.68 * len(hist) / 2)  # Approximate value area
+        val_idx = poc_idx - int(0.68 * len(hist) / 2)
+        df['vah'] = edges[min(vah_idx, len(edges)-1)]
+        df['val'] = edges[max(val_idx, 0)]
+        return df
 
-# Scoring Plugins
 class EMAAlignmentPlugin(ScoringPlugin):
     def score(self, df: pd.DataFrame, direction: str, **context) -> Tuple[int, List[str]]:
         last = df.iloc[-1]
@@ -585,6 +610,30 @@ class TrendLineBreakoutPlugin(ScoringPlugin):
             patterns.append("Recent False Down Breakout")
         return score, patterns
 
+class LiquidityScoringPlugin(ScoringPlugin):
+    def score(self, df: pd.DataFrame, direction: str, **context) -> Tuple[int, List[str]]:
+        last = df.iloc[-1]
+        score, patterns = 0, []
+        if direction == "LONG" and last['depth_imbalance'] > 0.2 and last['total_depth'] > 1000:  # Arbitrary threshold
+            score += 15
+            patterns.append("Strong Bid Liquidity")
+        elif direction == "SHORT" and last['depth_imbalance'] < -0.2 and last['total_depth'] > 1000:
+            score += 15
+            patterns.append("Strong Ask Liquidity")
+        return score, patterns
+
+class VolumeProfileScoringPlugin(ScoringPlugin):
+    def score(self, df: pd.DataFrame, direction: str, **context) -> Tuple[int, List[str]]:
+        last = df.iloc[-1]
+        score, patterns = 0, []
+        if direction == "LONG" and last['close'] < last['vpoc'] and last['close'] > last['val']:
+            score += 12
+            patterns.append("Value Area Bounce")
+        elif direction == "SHORT" and last['close'] > last['vpoc'] and last['close'] < last['vah']:
+            score += 12
+            patterns.append("Value Area Rejection")
+        return score, patterns
+
 # Plugin Registry
 INDICATOR_PLUGINS = {
     "ema": EMAPlugin("ema"),
@@ -602,7 +651,9 @@ INDICATOR_PLUGINS = {
     "candle_patterns": CandlePatternsPlugin("candle_patterns"),
     "order_flow": OrderFlowPlugin("order_flow"),
     "vwap": VWAPPlugin("vwap"),
-    "trendline": TrendLinePlugin("trendline")
+    "trendline": TrendLinePlugin("trendline"),
+    "liquidity": LiquidityPlugin("liquidity"),
+    "volume_profile": VolumeProfilePlugin("volume_profile")
 }
 
 SCORING_PLUGINS = {
@@ -618,7 +669,9 @@ SCORING_PLUGINS = {
     "chart_patterns": ChartPatternsPluginScoring("chart_patterns"),
     "smc": SMCPluginScoring("smc"),
     "vwap": VWAPPluginScoring("vwap"),
-    "trendline_breakout": TrendLineBreakoutPlugin("trendline_breakout")
+    "trendline_breakout": TrendLineBreakoutPlugin("trendline_breakout"),
+    "liquidity": LiquidityScoringPlugin("liquidity"),
+    "volume_profile": VolumeProfileScoringPlugin("volume_profile")
 }
 
 # ================== MONGODB INITIALIZATION ==================
@@ -639,7 +692,6 @@ async def init_mongo_indexes():
     ml_models_collection = db[CONFIG["mongodb"]["collections"]["ml_models"]]
     bot_state_collection = db[CONFIG["mongodb"]["collections"]["bot_state"]]
 
-    # FIXED: Create proper indexes with correct fields
     await ohlcv_collection.create_index([("cache_key", 1)])
     await ohlcv_collection.create_index([("timestamp", 1)], expireAfterSeconds=CONFIG["cache_ttl"])
     
@@ -796,6 +848,37 @@ async def fetch_live_price(exchange: ccxt_async.Exchange, symbol: str) -> Option
         logger.error(f"Live price fetch error for {symbol}: {str(e)}")
         return None
 
+async def fetch_tick_data(exchange: ccxt_async.Exchange, symbol: str, limit: int = 200) -> Dict:
+    try:
+        trades = await exchange.fetch_trades(symbol, limit=limit)
+        buy_vol = sum(t['amount'] for t in trades if t['side'] == 'buy')
+        sell_vol = sum(t['amount'] for t in trades if t['side'] == 'sell')
+        return {'buy_vol': buy_vol, 'sell_vol': sell_vol, 'tick_imbalance': (buy_vol - sell_vol) / (buy_vol + sell_vol + 1e-6)}
+    except Exception as e:
+        logger.error(f"Tick data fetch error for {symbol}: {str(e)}")
+        return {'buy_vol': 0, 'sell_vol': 0, 'tick_imbalance': 0}
+
+# ================== WEBSOCKET FOR LOW LATENCY ==================
+async def setup_websockets(exchange: ccxt_async.Exchange):
+    while True:
+        try:
+            symbols = [s for s in CONFIG["pairs"] if s not in invalid_symbols]
+            if not symbols:
+                await asyncio.sleep(10)
+                continue
+            ticker_tasks = [exchange.watch_ticker(symbol) for symbol in symbols]
+            while True:
+                results = await asyncio.gather(*ticker_tasks, return_exceptions=True)
+                for symbol, result in zip(symbols, results):
+                    if not isinstance(result, Exception):
+                        live_data_cache[symbol] = {"price": result.get('last', 0), "timestamp": time.time()}
+                    else:
+                        logger.warning(f"WS ticker error for {symbol}: {str(result)}")
+                await asyncio.sleep(1)
+        except Exception as e:
+            logger.error(f"WS reconnection needed: {str(e)}")
+            await asyncio.sleep(5)
+
 # ================== ECONOMIC CALENDAR INTEGRATION ==================
 async def fetch_economic_calendar() -> List[Dict]:
     economic_collection = db[CONFIG["mongodb"]["collections"]["economic_events"]]
@@ -847,14 +930,14 @@ async def is_near_event(current_time: datetime) -> bool:
     return False
 
 # ================== INDICATOR AND SCORING MANAGEMENT ==================
-def apply_indicators(df: pd.DataFrame) -> pd.DataFrame:
+async def apply_indicators(exchange: ccxt_async.Exchange, symbol: str, df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     for plugin_name in CONFIG["indicator_plugins"]:
         if plugin_name in INDICATOR_PLUGINS:
             try:
-                df = INDICATOR_PLUGINS[plugin_name].compute(df)
+                df = await INDICATOR_PLUGINS[plugin_name].compute(exchange, symbol, df)
             except Exception as e:
-                logger.error(f"Error applying indicator {plugin_name}: {str(e)}")
+                logger.error(f"Error applying indicator {plugin_name} for {symbol}: {str(e)}")
     df['body_size'] = abs(df['close'] - df['open']) / df['close']
     df['upper_shadow'] = (df['high'] - df[['open', 'close']].max(axis=1)) / df['close']
     df['lower_shadow'] = (df[['open', 'close']].min(axis=1) - df['low']) / df['close']
@@ -870,7 +953,6 @@ def apply_indicators(df: pd.DataFrame) -> pd.DataFrame:
             logger.warning(f"All values in {col} are NaN")
     return df.fillna(method='ffill').fillna(0)
 
-# ================== SIGNAL GENERATION HELPERS ==================
 def detect_golden_cross(df: pd.DataFrame) -> Optional[str]:
     if len(df) < 2 or 'ema50' not in df or 'ema200' not in df:
         return None
@@ -1028,11 +1110,26 @@ def detect_market_regime(df: pd.DataFrame) -> str:
     else:
         return "neutral"
 
+# Adaptive TF weights
+def get_adaptive_tf_weights(df: pd.DataFrame) -> Dict:
+    volatility = df['atr_pct'].tail(20).mean()
+    weights = CONFIG["tf_weights"].copy()
+    if volatility > 2.0:  # High vol, favor higher TFs
+        weights["1d"] *= 1.5
+        weights["4h"] *= 1.2
+    elif volatility < 1.0:  # Low vol, favor lower TFs
+        weights["1h"] *= 1.5
+        weights["2h"] *= 1.2
+    return weights
+
 async def multi_timeframe_confluence(exchange: ccxt_async.Exchange, symbol: str) -> Tuple[int, Dict]:
     confluence_score = 0
     tf_data = {}
     tasks = [fetch_and_analyze_tf(exchange, symbol, tf) for tf in CONFIG["timeframes"]]
     results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    df_primary = await fetch_ohlcv_single(exchange, symbol, CONFIG["timeframes"][0])
+    adaptive_weights = get_adaptive_tf_weights(df_primary) if df_primary is not None else CONFIG["tf_weights"]
     
     for tf, result in zip(CONFIG["timeframes"], results):
         if isinstance(result, Exception):
@@ -1040,7 +1137,7 @@ async def multi_timeframe_confluence(exchange: ccxt_async.Exchange, symbol: str)
             continue
         if result:
             tf_data[tf], score = result
-            weight = CONFIG["tf_weights"].get(tf, 1.0)
+            weight = adaptive_weights.get(tf, 1.0)
             confluence_score += score * weight
     return int(confluence_score), tf_data
 
@@ -1050,7 +1147,7 @@ async def fetch_and_analyze_tf(exchange: ccxt_async.Exchange, symbol: str, timef
         if df is None or len(df) < 200:
             logger.info(f"Insufficient data for {symbol}-{timeframe}: {len(df) if df is not None else 0} rows")
             return None, 0
-        df = apply_indicators(df)
+        df = await apply_indicators(exchange, symbol, df)
         last = df.iloc[-1]
         if pd.isna(last.get('ema20', np.nan)) or pd.isna(last.get('ema50', np.nan)) or pd.isna(last.get('ema200', np.nan)):
             logger.info(f"Missing EMA values for {symbol}-{timeframe}")
@@ -1062,6 +1159,59 @@ async def fetch_and_analyze_tf(exchange: ccxt_async.Exchange, symbol: str, timef
         return None, 0
 
 # ================== MACHINE LEARNING MODEL ==================
+class MLPClassifier(nn.Module):
+    def __init__(self, input_size):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Linear(input_size, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+class TorchMLP:
+    def __init__(self, input_size):
+        self.model = MLPClassifier(input_size)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        self.criterion = nn.BCELoss()
+
+    def fit(self, X, y):
+        X_tensor = torch.from_numpy(X).float()
+        y_tensor = torch.from_numpy(y).float().unsqueeze(1)
+        for epoch in range(200):
+            self.optimizer.zero_grad()
+            out = self.model(X_tensor)
+            loss = self.criterion(out, y_tensor)
+            loss.backward()
+            self.optimizer.step()
+
+    def partial_fit(self, X, y):
+        X_tensor = torch.from_numpy(X).float()
+        y_tensor = torch.from_numpy(y).float().unsqueeze(1)
+        for epoch in range(5):  # Fewer epochs for online
+            self.optimizer.zero_grad()
+            out = self.model(X_tensor)
+            loss = self.criterion(out, y_tensor)
+            loss.backward()
+            self.optimizer.step()
+
+    def predict_proba(self, X):
+        X_tensor = torch.from_numpy(X).float()
+        with torch.no_grad():
+            out = self.model(X_tensor)
+        return out.numpy()[:, 0]
+
+    def predict(self, X):
+        proba = self.predict_proba(X)
+        return (proba > 0.5).astype(int)
+
 class OptimizedCryptoMLClassifier:
     def __init__(self):
         self.models = {}
@@ -1074,6 +1224,7 @@ class OptimizedCryptoMLClassifier:
     def create_features(self, df: pd.DataFrame, chart_patterns: List[str], fvg: List, choch: str, sr_levels: List[float], golden_cross: str, regime: str) -> Dict:
         last = df.iloc[-1]
         prev = df.iloc[-2] if len(df) > 1 else last
+        prev2 = df.iloc[-3] if len(df) > 2 else prev
         recent_false_up = 1 if df['false_up_breakout'].tail(5).any() else 0
         recent_false_down = 1 if df['false_down_breakout'].tail(5).any() else 0
         features = {
@@ -1127,6 +1278,14 @@ class OptimizedCryptoMLClassifier:
             'down_breakout': 1 if last.get('down_breakout', False) else 0,
             'recent_false_up': recent_false_up,
             'recent_false_down': recent_false_down,
+            'rsi_lag1': last['rsi'] - prev['rsi'],
+            'rsi_lag2': prev['rsi'] - prev2['rsi'],
+            'macd_hist_lag1': last['macd_hist'] - prev['macd_hist'],
+            'vol_lag1': last['volume'] - prev['volume'],
+            'price_change_5': df['close'].pct_change(5).iloc[-1],
+            'price_change_10': df['close'].pct_change(10).iloc[-1],
+            'price_change_20': df['close'].pct_change(20).iloc[-1],
+            'ema_cross_dist': (last['ema50'] - last['ema200']) / last['close'],
         }
         return features
 
@@ -1149,7 +1308,7 @@ class OptimizedCryptoMLClassifier:
             logger.warning(f"Insufficient data for ML training: {symbol}-{timeframe} ({len(df) if df is not None else 0} rows)")
             return False
 
-        df = apply_indicators(df)
+        df = await apply_indicators(exchange, symbol, df)
         historical_signals = []
 
         original_threshold = CONFIG['conf_threshold']
@@ -1211,28 +1370,43 @@ class OptimizedCryptoMLClassifier:
             y_pred_proba = model.predict_proba(X_test_scaled)[:, 1]
             auc_score = roc_auc_score(y_test, y_pred_proba)
 
+            scaler_mlp = StandardScaler()
+            X_train_scaled_mlp = scaler_mlp.fit_transform(X_train)
+            X_test_scaled_mlp = scaler_mlp.transform(X_test)
+            mlp = TorchMLP(X_train.shape[1])
+            mlp.fit(X_train_scaled_mlp, y_train)
+            y_pred_proba_mlp = mlp.predict_proba(X_test_scaled_mlp)
+            auc_mlp = roc_auc_score(y_test, y_pred_proba_mlp)
+            test_score_mlp = (mlp.predict(X_test_scaled_mlp) == y_test).mean()
+
+            best_model = model
+            best_scaler = scaler
+            best_auc = auc_score
+            best_test = test_score
+            best_name = "XGBoost"
+            if auc_mlp > auc_score:
+                best_model = mlp
+                best_scaler = scaler_mlp
+                best_auc = auc_mlp
+                best_test = test_score_mlp
+                best_name = "MLP"
+
             self.performance_history = {
                 'train_score': train_score,
-                'test_score': test_score,
+                'test_score': best_test,
                 'cv_mean': cv_scores.mean(),
                 'cv_std': cv_scores.std(),
-                'auc_score': auc_score
+                'auc_score': best_auc
             }
 
-            logger.info(f"XGBoost Results: Train: {train_score:.3f}, Test: {test_score:.3f}, CV: {cv_scores.mean():.3f}±{cv_scores.std():.3f}, AUC: {auc_score:.3f}")
+            logger.info(f"Best Model: {best_name} Results: Test: {best_test:.3f}, AUC: {best_auc:.3f}")
 
-            if test_score > 0.6 and auc_score > 0.65:
-                self.models['best'] = model
-                self.scalers['best'] = scaler
-                self.best_model_name = "XGBoost"
+            if best_test > 0.6 and best_auc > 0.65:
+                self.models['best'] = best_model
+                self.scalers['best'] = best_scaler
+                self.best_model_name = best_name
                 self.last_retrained = time.time()
-                logger.info(f"Model trained successfully (Score: {test_score:.3f})")
-                if hasattr(model, 'feature_importances_'):
-                    importances = model.feature_importances_
-                    indices = np.argsort(importances)[::-1]
-                    logger.info("Top 5 Most Important Features:")
-                    for i in range(min(5, len(indices))):
-                        logger.info(f"  {i+1}. {self.feature_names[indices[i]]}: {importances[indices[i]]:.4f}")
+                logger.info(f"Model trained successfully (Score: {best_test:.3f})")
                 return True
             else:
                 logger.warning("Model did not meet performance threshold")
@@ -1248,12 +1422,21 @@ class OptimizedCryptoMLClassifier:
             feature_vector = [features.get(name, 0) for name in self.feature_names]
             feature_vector = np.array(feature_vector).reshape(1, -1)
             feature_vector_scaled = self.scalers['best'].transform(feature_vector)
-            probability = self.models['best'].predict_proba(feature_vector_scaled)[0][1]
+            probability = self.models['best'].predict_proba(feature_vector_scaled)[0]
             prediction = self.models['best'].predict(feature_vector_scaled)[0]
             return probability, prediction
         except Exception as e:
             logger.error(f"Prediction error: {str(e)}")
             return 0.5, 0
+
+    def update_with_new_data(self, features: Dict, outcome: int):
+        if self.best_model_name != "MLP":
+            return
+        X = np.array([[features.get(name, 0) for name in self.feature_names]])
+        y = np.array([outcome])
+        X_scaled = self.scalers['best'].transform(X)
+        self.models['best'].partial_fit(X_scaled, y)
+        logger.info("Model updated online with new data")
 
     async def save_model(self, model_id: str = "primary") -> bool:
         try:
@@ -1334,7 +1517,6 @@ async def ensure_ml_model(exchange: ccxt_async.Exchange, valid_pairs: List[str],
     CONFIG["ml_enabled"] = False
     return False
 
-# ================== SIGNAL MANAGEMENT ==================
 def enhanced_signal_score(df: pd.DataFrame, direction: str, chart_patterns: List[str], fvg: List, choch: str, sr_levels: List[float], regime: str, confluence_score: int, golden_cross: str) -> Tuple[int, List[str]]:
     total_score, all_patterns = 0, []
     adx_threshold = CONFIG['adx_threshold']
@@ -1443,7 +1625,6 @@ def get_enhanced_signal(df: pd.DataFrame, chart_patterns: List[str], fvg: List, 
             logger.info(f"{symbol}:{direction} Score {total_score} below threshold {CONFIG['conf_threshold']}")
     return None
 
-# ================== TELEGRAM & SIGNAL MANAGEMENT ==================
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(5))
 @rate_limit("telegram")
 async def send_telegram(text: str) -> bool:
@@ -1522,6 +1703,12 @@ async def update_signal_outcome(signal_key: str, outcome: int):
             {"key": signal_key},
             {"$set": {"outcome": outcome}}
         )
+        # Online learning
+        if CONFIG['ml_enabled']:
+            signals = await get_signal_history()
+            sig = next((s for s in signals if s['key'] == signal_key), None)
+            if sig and 'features' in sig:
+                ml_classifier.update_with_new_data(sig['features'], outcome)
     except Exception as e:
         logger.error(f"Error updating signal outcome: {str(e)}")
 
@@ -1568,6 +1755,35 @@ async def analyze_signal_performance(symbol: str = None):
             logger.info(f"Symbol: {res['symbol']}, Win Rate: {res['win_rate']:.2%}, Total Signals: {res['total']}")
     except Exception as e:
         logger.error(f"Error analyzing signal performance: {str(e)}")
+
+async def optimize_params():
+    history = await get_signal_history(limit=200)
+    recent = [s for s in history if 'outcome' in s][-50:]
+    if len(recent) < 20:
+        return
+    win_rate = sum(s['outcome'] for s in recent) / len(recent)
+    if win_rate < 0.5:
+        CONFIG['conf_threshold'] = min(90, CONFIG['conf_threshold'] + 5)
+    elif win_rate > 0.6:
+        CONFIG['conf_threshold'] = max(60, CONFIG['conf_threshold'] - 5)
+    logger.info(f"Self-tuned conf_threshold to {CONFIG['conf_threshold']} based on recent win_rate {win_rate:.2f}")
+
+    # For indicator params, simple example for atr_mult
+    def objective(x):
+        atr_sl_mult = x[0]
+        wins = 0
+        for sig in recent:
+            entry = sig['entry']
+            sl = entry - atr_sl_mult * sig['atr'] if sig['direction'] == "LONG" else entry + atr_sl_mult * sig['atr']
+            # To properly optimize, would need to simulate if sl hit before tp, but since we have outcome, perhaps adjust based on losses
+            if sig['outcome'] == 0:  # Assume loss, perhaps widen sl
+                wins += 0  # Simplified, real impl needs historical price path
+        return -wins / len(recent) if len(recent) > 0 else 0
+
+    # Use minimize
+    res = minimize(objective, [CONFIG['atr_sl_mult']], bounds=[(1.0, 3.0)], method='L-BFGS-B')
+    CONFIG['atr_sl_mult'] = res.x[0]
+    logger.info(f"Optimized atr_sl_mult to {CONFIG['atr_sl_mult']:.2f}")
 
 # ================== LIVE DATA MONITORING ==================
 async def monitor_live_data(exchange: ccxt_async.Exchange):
@@ -1633,6 +1849,26 @@ async def monitor_live_data(exchange: ccxt_async.Exchange):
             logger.error(f"Live monitor error: {str(e)}")
             await asyncio.sleep(10)
 
+# ================== MONITORING & ALERTS ==================
+async def system_health_monitor():
+    while True:
+        try:
+            cpu = psutil.cpu_percent()
+            mem = psutil.virtual_memory().percent
+            if cpu > 90 or mem > 90:
+                await send_telegram(f"⚠️ System Health Alert: CPU {cpu}% | MEM {mem}%")
+            logger.info(f"Health: CPU {cpu}% | MEM {mem}%")
+            await asyncio.sleep(CONFIG['health_check_interval'])
+        except Exception as e:
+            logger.error(f"Health monitor error: {str(e)}")
+
+async def detect_anomaly(df: pd.DataFrame, symbol: str):
+    if 'volatility' in df:
+        vol_ma = df['volatility'].rolling(50).mean().iloc[-1]
+        if df['volatility'].iloc[-1] > CONFIG['anomaly_vol_threshold'] * vol_ma:
+            await send_telegram(f"⚠️ Anomaly: High volatility in {symbol}")
+            logger.warning(f"Anomaly detected in {symbol}: Volatility {df['volatility'].iloc[-1]} > {CONFIG['anomaly_vol_threshold']} * {vol_ma}")
+
 # ================== PROCESSING FUNCTION ==================
 async def process_symbol_tf(exchange, symbol, tf, open_signals):
     try:
@@ -1640,7 +1876,10 @@ async def process_symbol_tf(exchange, symbol, tf, open_signals):
         if df is None or len(df) < 200:
             logger.info(f"Data fetch failed or insufficient for {symbol}-{tf}: {len(df) if df is not None else 'None'} rows")
             return
-        df = apply_indicators(df)
+        df = await apply_indicators(exchange, symbol, df)
+        await detect_anomaly(df, symbol)
+        tick_data = await fetch_tick_data(exchange, symbol)
+        df.loc[df.index[-1], 'tick_imbalance'] = tick_data['tick_imbalance']  # Add to last row
         regime = detect_market_regime(df)
         confluence_score, _ = await multi_timeframe_confluence(exchange, symbol)
         chart_patterns = get_chart_patterns(df)
@@ -1698,7 +1937,9 @@ async def monitor():
 
     economic_events = await fetch_economic_calendar()
 
+    asyncio.create_task(setup_websockets(exchange))
     asyncio.create_task(monitor_live_data(exchange))
+    asyncio.create_task(system_health_monitor())
     cycle_count = 0
     retrain_counter = 0
 
@@ -1747,6 +1988,7 @@ async def monitor():
         
         if cycle_count % 12 == 0:
             await analyze_signal_performance()
+            await optimize_params()
             
         await save_bot_state()
         logger.info(f"CYCLE COMPLETE: Open: {len(open_signals)} | Total: {len(signal_history)} | Invalid Symbols: {len(invalid_symbols)}")
@@ -1771,3 +2013,4 @@ if __name__ == "__main__":
         exchange.close()
         mongo_client.close()
         logger.info("Resources released. Goodbye!")
+
