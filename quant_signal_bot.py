@@ -23,11 +23,13 @@ from collections import defaultdict
 import re
 from functools import wraps
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo.errors import CollectionInvalid
+from dotenv import load_dotenv
+load_dotenv()
 
 warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
-
 # Configuration with defaults and validation
 CONFIG = {
     "telegram_token": os.environ.get("BOT_TOKEN", "YOUR_TELEGRAM_TOKEN_HERE"),
@@ -83,7 +85,7 @@ CONFIG = {
     "event_window_hours": 1,
     "event_currencies": ["USD"],
     "mongodb": {
-        "uri": os.environ.get("MONGODB_URI", "mongodb://localhost:27017"),
+        "uri": os.environ.get("MONGODB_URI", ""),
         "database": "crypto_trading_bot",
         "collections": {
             "signals": "signals",
@@ -98,7 +100,7 @@ CONFIG = {
 
 # Global state
 bot_status = {"status": "starting", "last_update": time.time(), "signals_count": 0}
-semaphore = asyncio.Semaphore(10)
+semaphore = asyncio.Semaphore(20)  # Increased for better parallelism
 live_data_cache = {}
 invalid_symbols = set()
 fernet = Fernet(CONFIG["encryption_key"].encode())
@@ -621,6 +623,15 @@ SCORING_PLUGINS = {
 
 # ================== MONGODB INITIALIZATION ==================
 async def init_mongo_indexes():
+    for col_name in CONFIG["mongodb"]["collections"].values():
+        try:
+            await db.create_collection(col_name)
+            logger.info(f"Collection '{col_name}' created.")
+        except CollectionInvalid:
+            logger.info(f"Collection '{col_name}' already exists.")
+        except Exception as e:
+            logger.warning(f"Could not create collection '{col_name}': {str(e)}")
+
     signal_collection = db[CONFIG["mongodb"]["collections"]["signals"]]
     ohlcv_collection = db[CONFIG["mongodb"]["collections"]["ohlcv"]]
     economic_collection = db[CONFIG["mongodb"]["collections"]["economic_events"]]
@@ -693,21 +704,19 @@ async def validate_symbols(exchange: ccxt_async.Exchange) -> List[str]:
     try:
         await exchange.load_markets(reload=True)
         markets = exchange.markets
-        perpetual_markets = [
-            symbol for symbol, market in markets.items()
-            if market.get('active', False) and
-               market.get('type') == 'swap' and
-               market.get('linear', False) and
-               symbol.endswith('USDT')
-        ]
         valid_pairs = []
         for symbol in CONFIG["pairs"]:
-            if symbol in perpetual_markets:
-                valid_pairs.append(symbol)
-                invalid_symbols.discard(symbol)
-                logger.info(f"Validated symbol: {symbol}")
+            if symbol in markets:  # Check if symbol exists in markets
+                market = markets[symbol]
+                if market.get('active') and market.get('swap') and market.get('linear'):
+                    valid_pairs.append(symbol)
+                    invalid_symbols.discard(symbol)
+                    logger.info(f"Validated symbol: {symbol}")
+                else:
+                    logger.warning(f"Symbol {symbol} not a linear perpetual future")
+                    invalid_symbols.add(symbol)
             else:
-                logger.warning(f"Symbol {symbol} not available in perpetual futures")
+                logger.warning(f"Symbol {symbol} not found in markets")
                 invalid_symbols.add(symbol)
         if not valid_pairs:
             logger.error("No valid trading symbols found")
@@ -720,16 +729,6 @@ async def validate_symbols(exchange: ccxt_async.Exchange) -> List[str]:
         await exchange.close()
 
 @retry(wait=wait_exponential(multiplier=2, min=2, max=30), stop=stop_after_attempt(15))
-async def fetch_ohlcv_batch(exchange: ccxt_async.Exchange, symbols: List[str], timeframe: str, limit: int = 300) -> Dict[str, Optional[pd.DataFrame]]:
-    results = {}
-    async with semaphore:
-        tasks = [fetch_ohlcv_single(exchange, symbol, timeframe, limit) for symbol in symbols if symbol not in invalid_symbols]
-        logger.info(f"Fetching data for {len(tasks)} symbols (skipped {len(invalid_symbols)} invalid symbols)")
-        ohlcv_data = await asyncio.gather(*tasks, return_exceptions=True)
-        for symbol, data in zip([s for s in symbols if s not in invalid_symbols], ohlcv_data):
-            results[symbol] = data if not isinstance(data, Exception) else None
-        return results
-
 async def fetch_ohlcv_single(exchange: ccxt_async.Exchange, symbol: str, timeframe: str, limit: int = 300) -> Optional[pd.DataFrame]:
     cache_key = f"{symbol}-{timeframe}"
     ohlcv_collection = db[CONFIG["mongodb"]["collections"]["ohlcv"]]
@@ -747,42 +746,43 @@ async def fetch_ohlcv_single(exchange: ccxt_async.Exchange, symbol: str, timefra
         logger.error(f"Error checking MongoDB cache for {cache_key}: {str(e)}")
 
     # Fetch from exchange if not cached
-    try:
-        data = await exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-        df = pd.DataFrame(data, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
-        df['ts'] = pd.to_datetime(df['ts'], unit='ms')
-        df.set_index('ts', inplace=True)
-
-        # Save to MongoDB
+    async with semaphore:
         try:
-            await ohlcv_collection.update_one(
-                {"cache_key": cache_key},
-                {"$set": {
-                    "cache_key": cache_key,
-                    "timestamp": time.time(),
-                    "data": df.reset_index().to_dict('records')
-                }},
-                upsert=True
-            )
-            logger.info(f"Saved OHLCV data to MongoDB for {cache_key}")
-        except Exception as e:
-            logger.error(f"Error saving OHLCV to MongoDB for {cache_key}: {str(e)}")
+            data = await exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+            df = pd.DataFrame(data, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
+            df['ts'] = pd.to_datetime(df['ts'], unit='ms')
+            df.set_index('ts', inplace=True)
 
-        logger.info(f"Fetched {len(df)} rows for {symbol}-{timeframe}")
-        return df
-    except ccxt_async.RateLimitExceeded as e:
-        logger.error(f"Rate limit exceeded for {symbol} {timeframe}: {str(e)}")
-        return None
-    except ccxt_async.NetworkError as e:
-        logger.error(f"Network error for {symbol} {timeframe}: {str(e)}")
-        return None
-    except ccxt_async.ExchangeError as e:
-        logger.error(f"Exchange error for {symbol} {timeframe}: {str(e)}")
-        invalid_symbols.add(symbol)
-        return None
-    except Exception as e:
-        logger.error(f"Unexpected error for {symbol} {timeframe}: {str(e)}")
-        return None
+            # Save to MongoDB
+            try:
+                await ohlcv_collection.update_one(
+                    {"cache_key": cache_key},
+                    {"$set": {
+                        "cache_key": cache_key,
+                        "timestamp": time.time(),
+                        "data": df.reset_index().to_dict('records')
+                    }},
+                    upsert=True
+                )
+                logger.info(f"Saved OHLCV data to MongoDB for {cache_key}")
+            except Exception as e:
+                logger.error(f"Error saving OHLCV to MongoDB for {cache_key}: {str(e)}")
+
+            logger.info(f"Fetched {len(df)} rows for {symbol}-{timeframe}")
+            return df
+        except ccxt_async.RateLimitExceeded as e:
+            logger.error(f"Rate limit exceeded for {symbol} {timeframe}: {str(e)}")
+            return None
+        except ccxt_async.NetworkError as e:
+            logger.error(f"Network error for {symbol} {timeframe}: {str(e)}")
+            return None
+        except ccxt_async.ExchangeError as e:
+            logger.error(f"Exchange error for {symbol} {timeframe}: {str(e)}")
+            invalid_symbols.add(symbol)
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error for {symbol} {timeframe}: {str(e)}")
+            return None
 
 async def fetch_live_price(exchange: ccxt_async.Exchange, symbol: str) -> Optional[float]:
     if symbol in invalid_symbols:
@@ -833,8 +833,8 @@ async def fetch_economic_calendar() -> List[Dict]:
         logger.error(f"Error fetching economic calendar: {str(e)}")
         return []
 
-def is_near_event(current_time: datetime) -> bool:
-    events = asyncio.run(fetch_economic_calendar())
+async def is_near_event(current_time: datetime) -> bool:
+    events = await fetch_economic_calendar()
     for event in events:
         try:
             event_time = event['date']
@@ -1633,6 +1633,47 @@ async def monitor_live_data(exchange: ccxt_async.Exchange):
             logger.error(f"Live monitor error: {str(e)}")
             await asyncio.sleep(10)
 
+# ================== PROCESSING FUNCTION ==================
+async def process_symbol_tf(exchange, symbol, tf, open_signals):
+    try:
+        df = await fetch_ohlcv_single(exchange, symbol, tf, limit=300)
+        if df is None or len(df) < 200:
+            logger.info(f"Data fetch failed or insufficient for {symbol}-{tf}: {len(df) if df is not None else 'None'} rows")
+            return
+        df = apply_indicators(df)
+        regime = detect_market_regime(df)
+        confluence_score, _ = await multi_timeframe_confluence(exchange, symbol)
+        chart_patterns = get_chart_patterns(df)
+        fvg = detect_fvg(df)
+        sr_levels = find_sr_zones(df)
+        choch = detect_bos_choch(df)
+        golden_cross = detect_golden_cross(df)
+        sig = get_enhanced_signal(df, chart_patterns, fvg, choch, sr_levels, regime, confluence_score, golden_cross, symbol)
+        if sig:
+            sig_key = f"{symbol}-{tf}-{sig['direction']}"
+            sig['key'] = sig_key
+            bar_ts = sig['bar_ts']
+            if sig_key in open_signals and open_signals[sig_key].get('bar_ts') == bar_ts:
+                return
+            cross_info = " | ✨ Golden Cross" if golden_cross == "golden" else " | ☠️ Death Cross" if golden_cross == "death" else ""
+            logger.info(f"SIGNAL: {symbol} {tf} {sig['direction']} | Score: {sig['score']} | ML: {sig['ml_confidence']:.3f}{cross_info}")
+            await update_open_signal(sig, status="open")
+            await log_signal(sig)
+            tps_str = ', '.join(f"{tp:.4f}" for tp in sig['tps'])
+            patterns_str = ', '.join(sig['patterns'][:3]) if sig['patterns'] else "None"
+            msg = (f"🤖 ENHANCED SIGNAL\n"
+                   f"📊 {symbol} {tf}: {sig['direction']}{cross_info}\n"
+                   f"🏆 ML Confidence: {sig['ml_confidence']:.2f} | ⚡ Score: {sig['score']}\n"
+                   f"💰 Entry: {sig['entry']:.4f} | 🛑 SL: {sig['sl']:.4f}\n"
+                   f"🎯 TPs: {tps_str} | ⚡ RR: {sig['rr']}\n"
+                   f"📋 Patterns: {patterns_str}")
+            if sig.get('pattern_target'):
+                msg += f"\n🎯 Pattern Target: {sig['pattern_target']:.4f}"
+            await send_telegram(msg)
+            bot_status["signals_count"] += 1
+    except Exception as e:
+        logger.error(f"Error processing {symbol}-{tf}: {str(e)}")
+
 # ================== MAIN MONITORING LOOP ==================
 async def monitor():
     validate_config()
@@ -1677,52 +1718,19 @@ async def monitor():
                         await ml_classifier.save_model()
 
         current_dt = datetime.now(timezone.utc)
-        if economic_events and is_near_event(current_dt):
+        if await is_near_event(current_dt):
             logger.info("Skipping signal generation due to nearby high-impact economic event")
             await asyncio.sleep(CONFIG['scan_interval'])
             continue
 
-        for symbol_batch in [CONFIG["pairs"][i:i+10] for i in range(0, len(CONFIG["pairs"]), 10)]:
-            for tf in CONFIG["timeframes"]:
-                try:
-                    ohlcv_batch = await fetch_ohlcv_batch(exchange, symbol_batch, tf)
-                    for symbol, df in ohlcv_batch.items():
-                        if df is None or len(df) < 200:
-                            logger.info(f"Data fetch failed or insufficient for {symbol}-{tf}: {len(df) if df is not None else 'None'} rows")
-                            continue
-                        df = apply_indicators(df)
-                        regime = detect_market_regime(df)
-                        confluence_score, _ = await multi_timeframe_confluence(exchange, symbol)
-                        chart_patterns = get_chart_patterns(df)
-                        fvg = detect_fvg(df)
-                        sr_levels = find_sr_zones(df)
-                        choch = detect_bos_choch(df)
-                        golden_cross = detect_golden_cross(df)
-                        sig = get_enhanced_signal(df, chart_patterns, fvg, choch, sr_levels, regime, confluence_score, golden_cross, symbol)
-                        if sig:
-                            sig_key = f"{symbol}-{tf}-{sig['direction']}"
-                            sig['key'] = sig_key
-                            bar_ts = sig['bar_ts']
-                            if sig_key in open_signals and open_signals[sig_key].get('bar_ts') == bar_ts:
-                                continue
-                            cross_info = " | ✨ Golden Cross" if golden_cross == "golden" else " | ☠️ Death Cross" if golden_cross == "death" else ""
-                            logger.info(f"SIGNAL: {symbol} {tf} {sig['direction']} | Score: {sig['score']} | ML: {sig['ml_confidence']:.3f}{cross_info}")
-                            await update_open_signal(sig, status="open")
-                            await log_signal(sig)
-                            tps_str = ', '.join(f"{tp:.4f}" for tp in sig['tps'])
-                            patterns_str = ', '.join(sig['patterns'][:3]) if sig['patterns'] else "None"
-                            msg = (f"🤖 ENHANCED SIGNAL\n"
-                                   f"📊 {symbol} {tf}: {sig['direction']}{cross_info}\n"
-                                   f"🏆 ML Confidence: {sig['ml_confidence']:.2f} | ⚡ Score: {sig['score']}\n"
-                                   f"💰 Entry: {sig['entry']:.4f} | 🛑 SL: {sig['sl']:.4f}\n"
-                                   f"🎯 TPs: {tps_str} | ⚡ RR: {sig['rr']}\n"
-                                   f"📋 Patterns: {patterns_str}")
-                            if sig.get('pattern_target'):
-                                msg += f"\n🎯 Pattern Target: {sig['pattern_target']:.4f}"
-                            await send_telegram(msg)
-                except Exception as e:
-                    logger.error(f"Error processing batch {symbol_batch}-{tf}: {str(e)}")
-                await asyncio.sleep(3)
+        # Parallel processing of all symbol-timeframe pairs
+        process_tasks = []
+        for tf in CONFIG["timeframes"]:
+            for symbol in CONFIG["pairs"]:
+                if symbol not in invalid_symbols:
+                    process_tasks.append(process_symbol_tf(exchange, symbol, tf, open_signals))
+
+        await asyncio.gather(*process_tasks, return_exceptions=True)
         
         if cycle_count % 6 == 0:
             signal_history = await get_signal_history(limit=1000)
