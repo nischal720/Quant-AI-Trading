@@ -14,3 +14,4 @@ motor==3.7.1
 torch==2.8.0
 psutil==7.0.0
 dotenv==0.9.9
+optuna==4.4.0
